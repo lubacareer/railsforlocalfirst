@@ -1,4 +1,5 @@
 import {
+  assertSafeObjectKey,
   assertSafeScalarValue,
   assertValidSqlIdentifier,
   quoteSqlIdentifier,
@@ -12,6 +13,12 @@ import type {
   SqlDialect,
   TableSchema,
 } from './types';
+
+/** Ordered persistence metadata columns shared by schema and SQL storage. */
+export const CRDT_METADATA_COLUMNS = [
+  '_crdt_hlc', '_column_hlcs', '_column_tie_values', '_tombstone_hlc',
+  '_causal_version', '_schema_version', '_unmapped_vault',
+] as const;
 
 export function validateTableSchema(schema: TableSchema): TableSchema {
   assertValidSqlIdentifier(schema.tableName, 'table name');
@@ -36,7 +43,8 @@ export function validateTableSchema(schema: TableSchema): TableSchema {
 
   for (const col of schema.columns) {
     assertValidSqlIdentifier(col.name, 'column name');
-    if (['_crdt_hlc', '_column_hlcs', '_column_tie_values', '_schema_version', '_unmapped_vault', '_tombstone_hlc', '_causal_version'].includes(col.name.toLowerCase())) {
+    assertSafeObjectKey(col.name);
+    if ((CRDT_METADATA_COLUMNS as readonly string[]).includes(col.name.toLowerCase())) {
       throw new SafetyViolationError('RESERVED_METADATA_COLUMN', `Column "${col.name}" is reserved for CRDT metadata.`);
     }
     if (seenColumns.has(col.name.toLowerCase())) {
@@ -49,6 +57,9 @@ export function validateTableSchema(schema: TableSchema): TableSchema {
 
     if (col.name === schema.primaryKey) {
       pkFound = true;
+      if (col.type !== 'TEXT') {
+        throw new SafetyViolationError('INVALID_PRIMARY_KEY_TYPE', `Primary key column "${col.name}" must have type TEXT.`);
+      }
       if (col.nullable) {
         throw new SafetyViolationError(
           'NULLABLE_PRIMARY_KEY',
@@ -127,13 +138,13 @@ export function compileCreateTableSql(schema: TableSchema, dialect: SqlDialect):
 
   // Sidecar metadata columns for local-first CRDT + forward-compatibility vault
   const metaJsonType = dialect === 'postgres' ? 'JSONB' : 'TEXT';
-  colDefs.push(`  "_crdt_hlc" TEXT NOT NULL`);
-  colDefs.push(`  "_column_hlcs" ${metaJsonType} NOT NULL`);
-  colDefs.push(`  "_column_tie_values" ${metaJsonType} NOT NULL`);
-  colDefs.push(`  "_tombstone_hlc" TEXT`);
-  colDefs.push(`  "_causal_version" INTEGER NOT NULL`);
-  colDefs.push(`  "_schema_version" INTEGER NOT NULL DEFAULT ${schema.version}`);
-  colDefs.push(`  "_unmapped_vault" ${metaJsonType} NOT NULL DEFAULT '{}'`);
+  const metadataTypes: Record<(typeof CRDT_METADATA_COLUMNS)[number], string> = {
+    _crdt_hlc: 'TEXT NOT NULL', _column_hlcs: `${metaJsonType} NOT NULL`,
+    _column_tie_values: `${metaJsonType} NOT NULL`, _tombstone_hlc: 'TEXT',
+    _causal_version: 'INTEGER NOT NULL', _schema_version: `INTEGER NOT NULL DEFAULT ${schema.version}`,
+    _unmapped_vault: `${metaJsonType} NOT NULL DEFAULT '{}'`,
+  };
+  for (const name of CRDT_METADATA_COLUMNS) colDefs.push(`  ${quoteSqlIdentifier(name)} ${metadataTypes[name]}`);
 
   return `CREATE TABLE IF NOT EXISTS ${tableIdent} (\n${colDefs.join(',\n')}\n);`;
 }
@@ -182,15 +193,16 @@ export function compileParameterizedInsert(
   }
 
   // Append metadata columns
-  const metaColumns = ['"_crdt_hlc"', '"_column_hlcs"', '"_column_tie_values"', '"_tombstone_hlc"', '"_causal_version"', '"_schema_version"', '"_unmapped_vault"'];
-  const metaValues: ScalarValue[] = [hlc, columnHlcsJson, columnTieValuesJson, tombstoneHlc, 2, schema.version, unmappedVaultJson];
+  const metaValues: Record<(typeof CRDT_METADATA_COLUMNS)[number], ScalarValue> = {
+    _crdt_hlc: hlc, _column_hlcs: columnHlcsJson, _column_tie_values: columnTieValuesJson,
+    _tombstone_hlc: tombstoneHlc, _causal_version: 2, _schema_version: schema.version,
+    _unmapped_vault: unmappedVaultJson,
+  };
 
-  for (let i = 0; i < metaColumns.length; i++) {
-    const metaCol = metaColumns[i]!;
-    const metaVal = metaValues[i]!;
-    columnIdents.push(metaCol);
+  for (const metaCol of CRDT_METADATA_COLUMNS) {
+    columnIdents.push(quoteSqlIdentifier(metaCol));
     placeholders.push(nextPlaceholder());
-    params.push(metaVal);
+    params.push(metaValues[metaCol]);
   }
 
   const sql = [
@@ -231,6 +243,7 @@ export function evolveTableSchema(
     switch (op.kind) {
       case 'add_column': {
         assertValidSqlIdentifier(op.column.name, 'added column');
+        assertSafeObjectKey(op.column.name);
         if (columns.some((c) => c.name === op.column.name)) {
           throw new SafetyViolationError(
             'COLUMN_ALREADY_EXISTS',
@@ -244,6 +257,8 @@ export function evolveTableSchema(
       case 'rename_column': {
         assertValidSqlIdentifier(op.from, 'source column');
         assertValidSqlIdentifier(op.to, 'target column');
+        assertSafeObjectKey(op.from);
+        assertSafeObjectKey(op.to);
         if (op.from === schema.primaryKey) {
           throw new SafetyViolationError(
             'CANNOT_RENAME_PRIMARY_KEY',
@@ -273,6 +288,7 @@ export function evolveTableSchema(
 
       case 'drop_column_to_vault': {
         assertValidSqlIdentifier(op.column, 'dropped column');
+        assertSafeObjectKey(op.column);
         if (op.column === schema.primaryKey) {
           throw new SafetyViolationError(
             'CANNOT_DROP_PRIMARY_KEY',
@@ -290,6 +306,11 @@ export function evolveTableSchema(
       }
 
       case 'transform_column': {
+        assertValidSqlIdentifier(op.column, 'transformed column');
+        assertSafeObjectKey(op.column);
+        if (op.column === schema.primaryKey) {
+          throw new SafetyViolationError('CANNOT_TRANSFORM_PRIMARY_KEY', `Cannot transform primary key column "${schema.primaryKey}".`);
+        }
         const idx = columns.findIndex((c) => c.name === op.column);
         if (idx === -1) {
           throw new SafetyViolationError(
@@ -297,16 +318,15 @@ export function evolveTableSchema(
             `Cannot transform missing column "${op.column}" in "${schema.tableName}".`
           );
         }
-        if (op.targetType) {
-          const existing = columns[idx]!;
-          columns[idx] = {
-            ...existing,
-            type: op.targetType,
-            ...(existing.defaultValue === undefined ? {} : {
-              defaultValue: assertSafeScalarValue(op.transform(existing.defaultValue), op.column, op.targetType, existing.nullable),
-            }),
-          };
-        }
+        const existing = columns[idx]!;
+        const type = op.targetType ?? existing.type;
+        columns[idx] = {
+          ...existing,
+          type,
+          ...(existing.defaultValue === undefined ? {} : {
+            defaultValue: assertSafeScalarValue(op.transform(existing.defaultValue), op.column, type, existing.nullable),
+          }),
+        };
         break;
       }
     }

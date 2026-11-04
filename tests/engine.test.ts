@@ -396,8 +396,9 @@ describe('Deterministic Offline Schema Migration & 4-Month Catch-Up Sync', () =>
             table: 'tasks',
             column: 'estimate_hours',
             fnName: 'faulty_fn',
-            transform: () => {
-              throw new Error('Simulated transform failure');
+            transform: (value) => {
+              if (value === 7) throw new Error('Simulated transform failure');
+              return value;
             },
           },
         ],

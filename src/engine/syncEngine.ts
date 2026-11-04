@@ -1,5 +1,5 @@
 import { CrdtTableStore } from './crdt';
-import { AuthenticatedPayloadError, decryptSyncEnvelope, encryptSyncOperations } from './crypto';
+import { AuthenticatedPayloadError, bytesToBase64, decryptSyncEnvelope, encryptSyncOperations } from './crypto';
 import { compareHlc, HybridLogicalClock } from './hlc';
 import { SchemaMigrationRegistry } from './migrator';
 import {
@@ -8,6 +8,8 @@ import {
   assertValidPrimaryKey,
   assertValidSqlIdentifier,
   createSafeRecord,
+  MAX_BATCH_OPERATIONS,
+  MAX_PAYLOAD_BYTES,
   SafetyViolationError,
 } from './safety';
 import { compileCreateTableSql } from './schema';
@@ -44,7 +46,6 @@ export class LocalFirstSyncEngine {
   private readonly quarantinedEnvelopeIds = new Set<string>();
   private pushInFlight: Promise<EncryptedSyncEnvelope | null> | null = null;
   private opSequence = 0;
-  private envelopeSequence = 0;
 
   constructor(options: LocalFirstSyncEngineOptions) {
     this.nodeId = assertValidNodeId(options.nodeId);
@@ -200,7 +201,8 @@ export class LocalFirstSyncEngine {
 
   /**
    * Encrypts pending offline mutations using AES-256-GCM + AAD and uploads the
-   * content-addressed envelope to the BYO storage adapter.
+   * envelope to the BYO storage adapter. Each call sends one bounded batch;
+   * operations that do not fit remain in the outbox for the next call.
    */
   public async pushToStorage(
     storage: StorageAdapter,
@@ -216,7 +218,7 @@ export class LocalFirstSyncEngine {
 
     // Copy cells as well as the array: callers can hold references to operations,
     // and migrations can replace queued operations while encryption is pending.
-    const snapshot = this.outbox.map((op) => ({
+    const candidates = this.outbox.slice(0, MAX_BATCH_OPERATIONS).map((op) => ({
       ...op,
       columns: createSafeRecord(Object.entries(op.columns).map(([name, cell]) => [name, { ...cell }])),
       ...(op.unmappedFields && {
@@ -228,14 +230,46 @@ export class LocalFirstSyncEngine {
         ),
       }),
     }));
-    const sentOperations = new Map(snapshot.map((op) => [op.opId, JSON.stringify(op)]));
-    const envelopeId = `env-${this.nodeId}-v${this.getCurrentVersion()}-${++this.envelopeSequence}`;
+    if (!globalThis.crypto?.getRandomValues) {
+      throw new SafetyViolationError('WEBCRYPTO_UNAVAILABLE', 'WebCrypto API is required to generate envelope IDs.');
+    }
+    // A random, compact key avoids collisions after restarts without exceeding
+    // the storage-key limit for long node IDs or schema versions.
+    const nonce = bytesToBase64(globalThis.crypto.getRandomValues(new Uint8Array(16)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const envelopeId = `env-${nonce}`;
     const schemaVersion = this.getCurrentVersion();
+    const table = this.getTableName();
+    const encoder = new TextEncoder();
+    const snapshot: CrdtChangeOperation[] = [];
+    let operationBytes = 0;
+    let minHlc = '';
+    let maxHlc = '';
+    for (const op of candidates) {
+      const nextMin = snapshot.length === 0 || compareHlc(op.hlc, minHlc) < 0 ? op.hlc : minHlc;
+      const nextMax = snapshot.length === 0 || compareHlc(op.hlc, maxHlc) > 0 ? op.hlc : maxHlc;
+      const nextOperationBytes = operationBytes + encoder.encode(JSON.stringify(op)).byteLength + (snapshot.length ? 1 : 0);
+      // This is the same payload shape serialized by encryptSyncOperations; the
+      // empty array contributes its brackets and the operation bytes add content.
+      const fixedBytes = encoder.encode(JSON.stringify({ protocolVersion: 3, envelopeId, nodeId: this.nodeId,
+        table, schemaVersion, minHlc: nextMin, maxHlc: nextMax, operations: [] })).byteLength;
+      if (fixedBytes + nextOperationBytes > MAX_PAYLOAD_BYTES) {
+        if (snapshot.length === 0) {
+          throw new SafetyViolationError('PAYLOAD_TOO_LARGE', 'A single queued operation exceeds the maximum sync payload size.');
+        }
+        break;
+      }
+      snapshot.push(op);
+      operationBytes = nextOperationBytes;
+      minHlc = nextMin;
+      maxHlc = nextMax;
+    }
+    const sentOperations = new Map(snapshot.map((op) => [op.opId, JSON.stringify(op)]));
     const push = (async () => {
       const envelope = await encryptSyncOperations({
         envelopeId,
         nodeId: this.nodeId,
-        table: this.getTableName(),
+        table,
         schemaVersion,
         operations: snapshot,
         passphrase,
@@ -294,7 +328,15 @@ export class LocalFirstSyncEngine {
       let envelopePreserved = 0;
       const envelopeConflicts: ConflictResolutionEvent[] = [];
       try {
-        const envelope = await storage.getEnvelope(envId);
+        let envelope: EncryptedSyncEnvelope | null;
+        try {
+          envelope = await storage.getEnvelope(envId);
+        } catch (error) {
+          // A per-object read error need not prevent later objects or the push.
+          // Keep it retryable; do not quarantine infrastructure failures.
+          rejectedEnvelopes.push({ envelopeId: envId, errorCode: error instanceof SafetyViolationError ? error.code : 'STORAGE_READ_FAILED' });
+          continue;
+        }
         if (!envelope) continue;
         if (envelope.envelopeId !== envId) {
           throw new SafetyViolationError('ENVELOPE_ID_MISMATCH', 'Storage returned an envelope with a different ID.');
@@ -400,7 +442,7 @@ export class LocalFirstSyncEngine {
           'INVALID_SYNC_OPERATION', 'HLC_EXCEEDS_OPERATION', 'HLC_EXCEEDS_ENVELOPE_MAX',
           'HLC_BELOW_ENVELOPE_MIN', 'INVALID_HLC_BOUNDS', 'HLC_NODE_MISMATCH',
           'INVALID_NODE_ID', 'TABLE_MISMATCH', 'INVALID_HLC_FORMAT', 'INVALID_HLC_TIMESTAMP',
-          'INVALID_HLC_COUNTER',
+          'INVALID_HLC_COUNTER', 'PRIMARY_KEY_MISMATCH',
         ]);
         if (err.code === 'CRYPTO_AUTHENTICATION_FAILED' || err instanceof AuthenticatedPayloadError ||
             (authenticated && permanentSemanticErrors.has(err.code))) {

@@ -2,7 +2,7 @@ import { compareHlc, parseHlc } from './hlc';
 import { isRowTombstoned, mergeCrdtRowStates } from './crdt';
 import { SchemaMigrationRegistry } from './migrator';
 import { assertSafeScalarValue, assertValidPrimaryKey, createSafeRecord, quoteSqlIdentifier, safeJsonParse, SafetyViolationError } from './safety';
-import { compileCreateTableSql, compileParameterizedInsert, defaultZeroForType } from './schema';
+import { compileCreateTableSql, compileParameterizedInsert, CRDT_METADATA_COLUMNS, defaultZeroForType } from './schema';
 import { validateVaultEntry } from './vault';
 import type { CrdtCell, CrdtRowState, ScalarValue, SqlDialect, TableSchema, UnmappedVaultEntry } from './types';
 
@@ -51,7 +51,7 @@ export function createSqliteAdapter(connection: SqliteConnection): SqlDatabaseAd
 export interface PostgresPool {
   connect(): Promise<{
     query(sql: string, params?: ScalarValue[]): Promise<{ rows: Record<string, unknown>[] }>;
-    release(): void;
+    release(error?: Error | boolean): void;
   }>;
 }
 
@@ -60,15 +60,20 @@ export function createPostgresAdapter(pool: PostgresPool): SqlDatabaseAdapter {
     dialect: 'postgres',
     async withWriteTransaction<T>(work: (tx: SqlTransaction) => Promise<T>): Promise<T> {
       const client = await pool.connect();
+      let broken: Error | undefined;
       try {
         await client.query('BEGIN');
         const result = await work({ async query(sql, params = []) { return (await client.query(sql, [...params])).rows; } });
         await client.query('COMMIT');
         return result;
       } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          broken = rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError));
+        }
         throw error;
-      } finally { client.release(); }
+      } finally { client.release(broken); }
     },
   };
 }
@@ -82,7 +87,8 @@ async function assertCausalColumns(tx: SqlTransaction, schema: TableSchema, dial
     ? await tx.query('SELECT name FROM pragma_table_xinfo(?)', [schema.tableName])
     : await tx.query('SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1', [schema.tableName]);
   const names = new Set(rows.map(row => String(row.name)));
-  if (!['_causal_version', '_tombstone_hlc', '_column_hlcs', '_column_tie_values', '_unmapped_vault'].every(name => names.has(name))) {
+  const causalColumns = CRDT_METADATA_COLUMNS.filter(name => name !== '_crdt_hlc' && name !== '_schema_version');
+  if (!causalColumns.every(name => names.has(name))) {
     throw new SafetyViolationError('SQL_SNAPSHOT_REGENERATION_REQUIRED', 'Snapshot lacks causal metadata; regenerate it from live CRDT state.');
   }
 }
@@ -92,7 +98,7 @@ async function assertExactColumns(tx: SqlTransaction, schema: TableSchema, diale
     ? await tx.query('SELECT name FROM pragma_table_xinfo(?)', [schema.tableName])
     : await tx.query('SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1', [schema.tableName]);
   const actual = new Set(rows.map(row => String(row.name)));
-  const expected = new Set([...schema.columns.map(col => col.name), '_crdt_hlc', '_column_hlcs', '_column_tie_values', '_tombstone_hlc', '_causal_version', '_schema_version', '_unmapped_vault']);
+  const expected = new Set([...schema.columns.map(col => col.name), ...CRDT_METADATA_COLUMNS]);
   if (actual.size !== expected.size || [...expected].some(name => !actual.has(name))) {
     throw new SafetyViolationError('SQL_MIGRATION_UNSUPPORTED_DEPENDENCY', 'Tables with extra or missing columns require a custom migration.');
   }
@@ -185,7 +191,7 @@ async function updateRow(tx: SqlTransaction, schema: TableSchema, row: CrdtRowSt
   // This overwrite is safe only because the row was read and merged while locked.
   const match = query.sql.indexOf('ON CONFLICT');
   const insert = query.sql.slice(0, match);
-  const names = [...schema.columns.map(c => c.name), '_crdt_hlc', '_column_hlcs', '_column_tie_values', '_tombstone_hlc', '_causal_version', '_schema_version', '_unmapped_vault'];
+  const names = [...schema.columns.map(c => c.name), ...CRDT_METADATA_COLUMNS];
   const assignments = names.filter(n => n !== schema.primaryKey).map(n => {
     const id = quoteSqlIdentifier(n, 'column');
     return `${id} = EXCLUDED.${id}`;
@@ -232,6 +238,43 @@ export async function listLiveSqlRows(db: SqlDatabaseAdapter, schema: TableSchem
   });
 }
 
+/** Ask SQLite to resolve view dependencies rather than matching SQL text. */
+async function assertSqliteViewsIndependent(tx: SqlTransaction, table: string): Promise<void> {
+  const readViews = () => tx.query(
+    "SELECT 'main' AS source_schema, name, sql FROM sqlite_master WHERE type = 'view' " +
+    "UNION ALL SELECT 'temp' AS source_schema, name, sql FROM sqlite_temp_master WHERE type = 'view' " +
+    'ORDER BY source_schema, name'
+  );
+  const original = await readViews();
+  if (original.length === 0) return;
+
+  const legacy = await tx.query('PRAGMA legacy_alter_table');
+  if (Number(legacy[0]?.legacy_alter_table) !== 0 || original.some(view => typeof view.sql !== 'string')) {
+    throw new SafetyViolationError('SQL_MIGRATION_UNSUPPORTED_DEPENDENCY', 'Cannot safely determine SQLite view dependencies.');
+  }
+
+  // The temporary rename makes SQLite rewrite every dependent view. The savepoint
+  // ensures the original table and view definitions remain untouched afterwards.
+  const probeName = `crdt_view_probe_${globalThis.crypto.randomUUID().replace(/-/g, '')}`;
+  await tx.query('SAVEPOINT crdt_view_dependency_probe');
+  let probeError: unknown;
+  let changed = false;
+  try {
+    await tx.query(`ALTER TABLE ${table} RENAME TO ${quoteSqlIdentifier(probeName, 'table')}`);
+    const rewritten = await readViews();
+    changed = JSON.stringify(original) !== JSON.stringify(rewritten);
+  } catch (error) {
+    probeError = error;
+  } finally {
+    await tx.query('ROLLBACK TO crdt_view_dependency_probe');
+    await tx.query('RELEASE crdt_view_dependency_probe');
+  }
+  if (probeError || changed) {
+    throw new SafetyViolationError('SQL_MIGRATION_UNSUPPORTED_DEPENDENCY',
+      probeError ? 'Cannot safely determine SQLite view dependencies.' : 'Views depending on this table require a custom migration.');
+  }
+}
+
 /** Execute a migration by upcasting row state and rebuilding the engine-managed table atomically. */
 export async function migrateSqlTable(db: SqlDatabaseAdapter, registry: SchemaMigrationRegistry, fromVersion: number, toVersion: number): Promise<void> {
   const source = registry.getSchemaAtVersion(fromVersion);
@@ -258,8 +301,7 @@ export async function migrateSqlTable(db: SqlDatabaseAdapter, registry: SchemaMi
           throw new SafetyViolationError('SQL_MIGRATION_UNSUPPORTED_DEPENDENCY', 'Foreign keys require a custom migration.');
         }
       }
-      const views = await tx.query("SELECT name FROM sqlite_master WHERE type = 'view'");
-      if (views.length) throw new SafetyViolationError('SQL_MIGRATION_UNSUPPORTED_DEPENDENCY', 'Views require a custom migration.');
+      await assertSqliteViewsIndependent(tx, table);
     } else {
       // to_regclass parses SQL identifiers; pass the quoted name so mixed-case
       // names cannot bypass the dependency/security checks.

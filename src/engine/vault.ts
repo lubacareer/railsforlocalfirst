@@ -1,6 +1,6 @@
 ﻿import { compareHlc } from './hlc';
 import { formatHlc, parseHlc } from './hlc';
-import { assertSafeScalarValue, assertValidSqlIdentifier, SafetyViolationError } from './safety';
+import { assertSafeObjectKey, assertSafeScalarValue, assertValidSqlIdentifier, SafetyViolationError } from './safety';
 import type { CrdtCell, ScalarValue, UnmappedVaultEntry } from './types';
 
 /** Same scalar ordering used by all in-memory and persistence merges. */
@@ -26,9 +26,18 @@ export function canonicalHlc(hlc: string): string {
   return formatHlc(parseHlc(hlc));
 }
 
-/** Entries without a position are legacy/ambiguous and remain distinct from known entries. */
+/** Keep unproven legacy incarnations distinct until their provenance is explicitly mapped. */
 export function vaultIdentity(entry: UnmappedVaultEntry): string {
-  return JSON.stringify([entry.lineageId ?? null, entry.sourceVersion, entry.schemaPosition ?? null]);
+  const provenance = [entry.lineageId ?? null, entry.sourceVersion, entry.schemaPosition ?? null];
+  if (entry.lineageId === undefined && entry.schemaPosition === undefined) {
+    // A legacy index is an order in a particular snapshot, not a durable identity.
+    // Without provenance we cannot assume even different clocks describe the same
+    // register, so retain every distinct value/clock/tie tuple.
+    return JSON.stringify([...provenance, entry.value,
+      Object.prototype.hasOwnProperty.call(entry, 'tieValue') ? [true, entry.tieValue] : [false],
+      canonicalHlc(entry.hlc)]);
+  }
+  return JSON.stringify(provenance);
 }
 
 export function flattenVaultEntry(entry: UnmappedVaultEntry): UnmappedVaultEntry[] {
@@ -50,6 +59,7 @@ export function flattenVaultEntry(entry: UnmappedVaultEntry): UnmappedVaultEntry
 
 export function validateVaultEntry(entry: UnmappedVaultEntry, field: string): void {
   assertValidSqlIdentifier(field, 'unmapped field');
+  assertSafeObjectKey(field);
   for (const item of flattenVaultEntry(entry)) {
     assertSafeScalarValue(item.value, field);
     if (Object.prototype.hasOwnProperty.call(item, 'tieValue')) assertSafeScalarValue(item.tieValue, `${field} tie value`);

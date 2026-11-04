@@ -10,7 +10,7 @@ const postgresUrl = process.env.TEST_POSTGRES_URL;
 if (process.env.REQUIRE_POSTGRES_TESTS === '1' && !postgresUrl) {
   throw new Error('TEST_POSTGRES_URL is required when REQUIRE_POSTGRES_TESTS=1');
 }
-const sqliteAvailable = Number(process.versions.node.split('.')[0]) >= 22;
+const sqliteAvailable = await import('node:sqlite').then(() => true, () => false);
 const clock = (wallTimeMs: number, nodeId = 'remote') => formatHlc({ wallTimeMs, counter: 0, nodeId });
 const schemaFor = (tableName: string): TableSchema => ({
   tableName, version: 1, primaryKey: 'id', columns: [

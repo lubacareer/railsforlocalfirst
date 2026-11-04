@@ -17,6 +17,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
    - Uses epoch-zero HLC (`000000000000000:0000:schema-default`) for schema defaults so explicit user edits from any peer always beat synthetic migration defaults.
    - **Forward-Compatibility Vault (`_unmapped_vault`)**: Preserves incompatible and unknown future fields with their schema provenance. A field is restored only when its lineage is known. Reusing a dropped column name creates a new field unless `add_column.restoreFrom` explicitly identifies the archived lineage. Ambiguous legacy entries remain in the vault for explicit mapping.
    - `mapLegacyVaultEntry` maps an ambiguous entry on a single engine instance after the caller determines its provenance. Mapping is local-only: apply it to every persisted peer copy because vault removals are not currently synchronized.
+   - Legacy entry indexes refer to the current vault snapshot and can change after merges. Primary keys must be TEXT and cannot be transformed by schema migrations.
 
 2. **Join-Semilattice Column-Level CRDT + Hybrid Logical Clock (`src/engine/crdt.ts`, `src/engine/hlc.ts`)**
    - Monotonic Hybrid Logical Clock (`<15-digit-wallTimeMs>:<4-hex-counter>:<nodeId>`) with configurable maximum drift bounds (`maxDriftMs`) to block rogue future-clock poisoning attacks.
@@ -29,6 +30,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
    - New envelopes use protocol v3. Existing v2 envelopes can be read, but their `createdAtIso` is unauthenticated and must not be trusted. Protocol v1 is unsupported; older clients cannot read v3 envelopes.
    - AAD does not prevent replay or rollback. Processed envelope IDs are suppressed only for the lifetime of one engine instance; the in-memory adapter refuses replacement of an existing ID but does not reject older valid envelopes. Older schema operations are upcast before application.
    - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope.
+   - Each push sends one bounded batch; call it again while the outbox is non-empty. A per-envelope storage read failure is reported as `STORAGE_READ_FAILED` and remains retryable.
 
 4. **SQLite & PostgreSQL CRDT Persistence (`src/engine/sqlStore.ts`)**
    - `exportSqlSnapshot` returns table DDL and full CRDT row states, including deleted rows. Use `mergeSqlRowState` with `createSqliteAdapter` or `createPostgresAdapter` to merge each state under a write transaction; use `listLiveSqlRows` to read non-deleted rows. The application supplies the database connection and persists its outbox separately.
@@ -41,7 +43,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
 
 - **Zero SQL Injection**: Identifiers are strictly allowlisted (`/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/`) and checked against reserved SQL keywords; runtime values are bound parameters.
 - **Prototype Pollution Defense**: `safeJsonParse` and `assertNoPrototypePollution` reject `__proto__`, `constructor`, and `prototype` keys at every boundary.
-- **SSRF & Path Traversal Protection**: BYO-Storage configuration blocks non-HTTPS endpoints, embedded credentials, restricted literal IPs and metadata hostnames, and `..` key traversal. This is hostname validation only; it does not resolve DNS. A network adapter must validate every resolved address at connection time, including after redirects, and connect to the validated address to prevent DNS rebinding.
+- **SSRF & Path Traversal Protection**: For S3-compatible storage, configuration validates the endpoint and blocks non-HTTPS URLs, embedded credentials, restricted literal IPs, and metadata hostnames. Storage keys are separately checked for `..` traversal. Endpoint hostname validation does not resolve DNS. A network adapter must validate every resolved address at connection time, including after redirects, and connect to the validated address to prevent DNS rebinding.
 - **Content Security Policy (CSP)**: Production HTML contains a restrictive CSP meta tag; development HTML omits it for Vite. Configure the hosting layer to send `Content-Security-Policy: frame-ancestors 'none'` (or `X-Frame-Options: DENY`) as an HTTP response header: browsers ignore `frame-ancestors` in a meta tag.
 
 ---

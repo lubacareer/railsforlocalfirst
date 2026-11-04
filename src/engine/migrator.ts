@@ -1,5 +1,6 @@
 import { formatHlc } from './hlc';
 import {
+  assertSafeObjectKey,
   assertSafeScalarValue,
   assertValidSqlIdentifier,
   createSafeRecord,
@@ -168,10 +169,10 @@ export class SchemaMigrationRegistry {
     this.getSchemaAtVersion(version);
     const initial: LineageState = createSafeRecord();
     for (const col of this.initialSchema.columns) {
-      initial[col.name] = { id: `v${this.initialSchema.version}:base:${col.name}`, revision: 0 };
+      initial[assertSafeObjectKey(col.name)] = { id: `v${this.initialSchema.version}:base:${col.name}`, revision: 0 };
     }
-    const history = new Map<number, LineageState>([[this.initialSchema.version, { ...initial }]]);
-    const current: LineageState = { ...initial };
+    const history = new Map<number, LineageState>([[this.initialSchema.version, createSafeRecord(Object.entries(initial))]]);
+    const current: LineageState = createSafeRecord(Object.entries(initial));
     const revisions = new Map(Object.values(initial).map((lineage) => [lineage.id, lineage.revision]));
     if (version === this.initialSchema.version) {
       if (position !== 'end') throw new SafetyViolationError('INVALID_SCHEMA_POSITION', 'Initial schema has no migration operations.');
@@ -187,7 +188,9 @@ export class SchemaMigrationRegistry {
         if (op.table !== this.getTableName()) continue;
         switch (op.kind) {
           case 'add_column': {
+            assertSafeObjectKey(op.column.name);
             if (op.restoreFrom) {
+              assertSafeObjectKey(op.restoreFrom.column);
               const restored = history.get(op.restoreFrom.version)?.[op.restoreFrom.column];
               if (!restored) throw new SafetyViolationError('UNKNOWN_RESTORED_LINEAGE', 'restoreFrom must identify a field in an earlier registered schema.');
               if (Object.values(current).some((active) => active.id === restored.id)) {
@@ -201,13 +204,16 @@ export class SchemaMigrationRegistry {
             break;
           }
           case 'rename_column': {
+            assertSafeObjectKey(op.from);
+            assertSafeObjectKey(op.to);
             const prior = current[op.from];
             if (prior) current[op.to] = prior;
             delete current[op.from];
             break;
           }
-          case 'drop_column_to_vault': delete current[op.column]; break;
+          case 'drop_column_to_vault': delete current[assertSafeObjectKey(op.column)]; break;
           case 'transform_column': {
+            assertSafeObjectKey(op.column);
             const prior = current[op.column];
             if (prior) {
               current[op.column] = { ...prior, revision: prior.revision + 1 };
@@ -217,7 +223,7 @@ export class SchemaMigrationRegistry {
           }
         }
       }
-      history.set(step.toVersion, { ...current });
+      history.set(step.toVersion, createSafeRecord(Object.entries(current)));
     }
     return current;
   }
@@ -277,6 +283,7 @@ export class SchemaMigrationRegistry {
   /** Explicitly assign provenance to one ambiguous legacy entry; no value is guessed. */
   public mapLegacyVaultEntry(row: CrdtRowState, field: string, legacyIndex: number, sourceVersion: number, schemaPosition: number | 'end'): CrdtRowState {
     assertValidSqlIdentifier(field, 'unmapped field');
+    assertSafeObjectKey(field);
     const result = cloneRowState(row);
     const packed = result.unmappedFields[field];
     if (!packed || !Number.isSafeInteger(legacyIndex) || legacyIndex < 0) {
