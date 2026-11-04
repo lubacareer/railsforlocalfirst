@@ -111,6 +111,21 @@ function metadata<T>(value: unknown, name: string): T {
   return safeJsonParse<T>(typeof value === 'string' ? value : JSON.stringify(value));
 }
 
+/** Preserve SQL numeric meaning before any lossy JavaScript conversion. */
+function parseSqlNumeric(value: string, type: 'INTEGER' | 'REAL', column: string): number {
+  const invalid = () => new SafetyViolationError('INVALID_SQL_NUMERIC_VALUE', `Column "${column}" contains an invalid ${type} value.`);
+  if (type === 'INTEGER') {
+    if (!/^[+-]?\d+$/.test(value)) throw invalid();
+    const exact = BigInt(value);
+    if (exact < BigInt(Number.MIN_SAFE_INTEGER) || exact > BigInt(Number.MAX_SAFE_INTEGER)) throw invalid();
+    return Number(exact);
+  }
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) throw invalid();
+  const number = Number(value);
+  if (!Number.isFinite(number)) throw invalid();
+  return number;
+}
+
 function parseSqlRow(schema: TableSchema, row: Record<string, unknown>): CrdtRowState {
   if (Number(row._causal_version) !== 2 || !Object.hasOwn(row, '_tombstone_hlc')) {
     throw new SafetyViolationError('SQL_SNAPSHOT_REGENERATION_REQUIRED', 'Snapshot lacks causal metadata; regenerate it from live CRDT state.');
@@ -144,7 +159,7 @@ function parseSqlRow(schema: TableSchema, row: Record<string, unknown>): CrdtRow
     parseHlc(hlc);
     let value = row[col.name];
     if (col.type === 'BOOLEAN' && typeof value === 'number') value = Boolean(value);
-    if ((col.type === 'INTEGER' || col.type === 'REAL') && typeof value === 'string') value = Number(value);
+    if ((col.type === 'INTEGER' || col.type === 'REAL') && typeof value === 'string') value = parseSqlNumeric(value, col.type, col.name);
     cells[col.name] = { value: assertSafeScalarValue(value, col.name, col.type, col.nullable), hlc,
       ...(Object.hasOwn(tieValues, col.name) ? { tieValue: tieValues[col.name]! } : {}) };
   }

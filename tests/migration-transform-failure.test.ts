@@ -12,11 +12,24 @@ const schema: TableSchema = {
   ],
 };
 const password = 'correct-horse-battery-2026';
+const failures: { name: string; create: () => unknown }[] = [
+  { name: 'Error', create: () => new Error('transform unavailable') },
+  { name: 'null-prototype object', create: () => Object.create(null) },
+  { name: 'throwing conversion', create: () => ({ toString() { throw new Error('conversion failed'); } }) },
+  { name: 'throwing message getter', create: () => Object.defineProperty(new Error(), 'message', {
+    get() { throw new Error('message failed'); },
+  }) },
+  { name: 'revoked proxy', create: () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    return proxy;
+  } },
+];
 
 describe('migration transform failures', () => {
-  it('rolls back a rejected envelope, applies later envelopes, pushes local work and retries', async () => {
+  it.each(failures)('handles $name while rolling back, continuing, pushing and retrying', async ({ create }) => {
     let fail = true;
-    const failure = new Error('transform unavailable');
+    const failure = create();
     const step: MigrationStep = { fromVersion: 1, toVersion: 2, description: 'transform', operations: [
       { kind: 'transform_column', table: 'items', column: 'value', fnName: 'convert', transform: value => {
         if (value === 7 && fail) throw failure;
@@ -55,8 +68,8 @@ describe('migration transform failures', () => {
     expect(receiver.getRow('bad')?.value).toBe(14);
   });
 
-  it('preserves the cause when local migration throws', () => {
-    const failure = new Error('local transform unavailable');
+  it.each(failures)('preserves the original $name cause when local migration throws', ({ create }) => {
+    const failure = create();
     const registry = new SchemaMigrationRegistry(schema, [{ fromVersion: 1, toVersion: 2, description: 'transform', operations: [
       { kind: 'transform_column', table: 'items', column: 'value', fnName: 'convert', transform: value => {
         if (value === 7) throw failure;
@@ -70,9 +83,33 @@ describe('migration transform failures', () => {
       expect.fail('migration should throw');
     } catch (error) {
       expect(error).toBeInstanceOf(MigrationTransformError);
-      expect(error).toMatchObject({ code: 'MIGRATION_TRANSFORM_FAILED', cause: failure });
+      expect((error as MigrationTransformError).code).toBe('MIGRATION_TRANSFORM_FAILED');
+      expect((error as MigrationTransformError).cause).toBe(failure);
       expect(engine.getCurrentVersion()).toBe(1);
       expect(engine.getRow('one')?.value).toBe(7);
     }
+  });
+
+  it('restores queued operations, all rows, version and conflict history after partial migration', () => {
+    const registry = new SchemaMigrationRegistry(schema, [{ fromVersion: 1, toVersion: 2, description: 'transform', operations: [
+      { kind: 'transform_column', table: 'items', column: 'value', fnName: 'convert', transform: value => {
+        if (value === 7) throw new Error('second queued operation fails');
+        return Number(value) * 2;
+      } },
+    ] }]);
+    const engine = new LocalFirstSyncEngine({ nodeId: 'local', registry, initialActiveVersion: 1 });
+    engine.upsert('first', { value: 2 }, 1000);
+    engine.upsert('second', { value: 7 }, 1100);
+    engine.upsert('second', { value: 3 }, 1200);
+    const outbox = JSON.stringify(engine.getPendingOutbox());
+    const rows = JSON.stringify(engine.listRawRowStates());
+    const conflicts = JSON.stringify(engine.getConflictLog());
+    expect(engine.getPendingOutboxCount()).toBe(3);
+    expect(engine.getConflictLog().length).toBeGreaterThan(0);
+    expect(() => engine.migrateToVersion(2)).toThrow(/second queued operation fails/);
+    expect(engine.getCurrentVersion()).toBe(1);
+    expect(JSON.stringify(engine.getPendingOutbox())).toBe(outbox);
+    expect(JSON.stringify(engine.listRawRowStates())).toBe(rows);
+    expect(JSON.stringify(engine.getConflictLog())).toBe(conflicts);
   });
 });

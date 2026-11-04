@@ -99,7 +99,8 @@ export class HybridLogicalClock {
       throw new SafetyViolationError('INVALID_DRIFT_CONFIG', 'maxDriftMs must be a positive integer.');
     }
     this.maxDriftMs = maxDriftMs;
-    this.lastWallTimeMs = Math.max(0, Math.trunc(initialWallTimeMs));
+    formatHlc({ wallTimeMs: initialWallTimeMs, counter: 0, nodeId: this.nodeId });
+    this.lastWallTimeMs = initialWallTimeMs;
     this.lastCounter = 0;
   }
 
@@ -115,24 +116,18 @@ export class HybridLogicalClock {
   }
 
   public restoreState(state: { readonly wallTimeMs: number; readonly counter: number }): void {
-    this.lastWallTimeMs = state.wallTimeMs;
-    this.lastCounter = state.counter;
+    const { wallTimeMs, counter } = state;
+    formatHlc({ wallTimeMs, counter, nodeId: this.nodeId });
+    this.lastWallTimeMs = wallTimeMs;
+    this.lastCounter = counter;
   }
 
   public now(physicalTimeMs = Date.now()): string {
     const safePhysical = this.validatePhysicalTime(physicalTimeMs);
     if (safePhysical > this.lastWallTimeMs) {
-      this.lastWallTimeMs = safePhysical;
-      this.lastCounter = 0;
-    } else {
-      this.incrementCounter(safePhysical);
+      return this.commitNextState(safePhysical, 0, safePhysical);
     }
-
-    return formatHlc({
-      wallTimeMs: this.lastWallTimeMs,
-      counter: this.lastCounter,
-      nodeId: this.nodeId,
-    });
+    return this.commitNextState(this.lastWallTimeMs, this.lastCounter + 1, safePhysical);
   }
 
   /** Validate a remote timestamp without advancing the clock. */
@@ -153,54 +148,44 @@ export class HybridLogicalClock {
     const remote = this.validateRemoteHlc(remoteHlcString, safePhysical);
 
     if (safePhysical > this.lastWallTimeMs && safePhysical > remote.wallTimeMs) {
-      this.lastWallTimeMs = safePhysical;
-      this.lastCounter = 0;
+      return this.commitNextState(safePhysical, 0, safePhysical);
     } else if (this.lastWallTimeMs === remote.wallTimeMs) {
-      this.lastCounter = Math.max(this.lastCounter, remote.counter) + 1;
-      this.handleOverflowIfNeeded(safePhysical);
+      return this.commitNextState(this.lastWallTimeMs, Math.max(this.lastCounter, remote.counter) + 1, safePhysical);
     } else if (this.lastWallTimeMs > remote.wallTimeMs) {
-      this.incrementCounter(safePhysical);
-    } else {
-      this.lastWallTimeMs = remote.wallTimeMs;
-      this.lastCounter = remote.counter + 1;
-      this.handleOverflowIfNeeded(safePhysical);
+      return this.commitNextState(this.lastWallTimeMs, this.lastCounter + 1, safePhysical);
     }
-
-    return formatHlc({
-      wallTimeMs: this.lastWallTimeMs,
-      counter: this.lastCounter,
-      nodeId: this.nodeId,
-    });
+    return this.commitNextState(remote.wallTimeMs, remote.counter + 1, safePhysical);
   }
 
-  private incrementCounter(physicalTimeMs: number): void {
-    this.lastCounter += 1;
-    this.handleOverflowIfNeeded(physicalTimeMs);
-  }
-
-  private handleOverflowIfNeeded(physicalTimeMs: number): void {
-    if (this.lastCounter > MAX_COUNTER) {
-      const nextWall = this.lastWallTimeMs + 1;
-      if (nextWall - physicalTimeMs > this.maxDriftMs) {
+  /** Validate a complete candidate before changing either part of the clock. */
+  private commitNextState(wallTimeMs: number, counter: number, physicalTimeMs: number): string {
+    if (counter > MAX_COUNTER) {
+      const nextWall = wallTimeMs + 1;
+      if (nextWall > MAX_WALL_TIME_MS || nextWall - physicalTimeMs > this.maxDriftMs) {
         throw new SafetyViolationError(
           'HLC_COUNTER_OVERFLOW',
-          'HLC logical counter overflowed and advancing wallTimeMs would exceed maxDriftMs.'
+          'HLC logical counter overflowed and advancing wallTimeMs would exceed its timestamp or drift bounds.'
         );
       }
-      this.lastWallTimeMs = nextWall;
-      this.lastCounter = 0;
+      wallTimeMs = nextWall;
+      counter = 0;
     }
+    const formatted = formatHlc({ wallTimeMs, counter, nodeId: this.nodeId });
+    this.lastWallTimeMs = wallTimeMs;
+    this.lastCounter = counter;
+    return formatted;
   }
 
   private validatePhysicalTime(physicalTimeMs: number): number {
     if (
       typeof physicalTimeMs !== 'number' ||
       !Number.isFinite(physicalTimeMs) ||
-      physicalTimeMs < 0
+      physicalTimeMs < 0 ||
+      physicalTimeMs > MAX_WALL_TIME_MS
     ) {
       throw new SafetyViolationError(
         'INVALID_PHYSICAL_TIME',
-        `Physical clock reading must be a non-negative finite number, got ${String(physicalTimeMs)}.`
+        `Physical clock reading must be a finite number between 0 and ${MAX_WALL_TIME_MS}, got ${String(physicalTimeMs)}.`
       );
     }
     return Math.trunc(physicalTimeMs);

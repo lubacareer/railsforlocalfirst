@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { productionCsp } from '../vite.config';
 
+function parsePolicy(policy: string): Map<string, string[]> {
+  const entries = policy.split(';').map(part => part.trim().split(/\s+/))
+    .filter(parts => parts[0]).map(([name, ...values]) => [name!, values] as const);
+  const names = entries.map(([name]) => name.toLowerCase());
+  expect(new Set(names).size, 'CSP directive names must be unique').toBe(names.length);
+  return new Map(entries);
+}
+
 describe('production CSP', () => {
   it('omits the meta policy from the dev server and injects it for production', () => {
     const hook = productionCsp().transformIndexHtml as unknown as (
@@ -14,7 +22,7 @@ describe('production CSP', () => {
     expect(result[0]?.injectTo).toBe('head-prepend');
     expect(result[0]?.attrs.content).toContain("default-src 'self'");
     expect(result[0]?.attrs.content).not.toContain('frame-ancestors');
-    const directives = new Map(result[0]!.attrs.content!.split(';').map(part => part.trim().split(/\s+/)).filter(parts => parts[0]).map(([name, ...values]) => [name!, values]));
+    const directives = parsePolicy(result[0]!.attrs.content!);
     expect(directives).toEqual(new Map([
       ['default-src', ["'self'"]],
       ['script-src', ["'self'"]],
@@ -24,5 +32,9 @@ describe('production CSP', () => {
       ['object-src', ["'none'"]],
       ['base-uri', ["'self'"]],
     ]));
+  });
+
+  it.each(['script-src', 'SCRIPT-SRC'])('rejects duplicate %s directives before Map overwrites them', name => {
+    expect(() => parsePolicy(`script-src *; ${name} 'self';`)).toThrow(/CSP directive names must be unique/);
   });
 });

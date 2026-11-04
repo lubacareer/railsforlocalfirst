@@ -51,12 +51,20 @@ export class SafetyViolationError extends Error {
   }
 }
 
+function describeThrownValue(value: unknown): string {
+  try {
+    return value instanceof Error ? String(value.message) : String(value);
+  } catch {
+    return 'Unprintable thrown value';
+  }
+}
+
 /** A caller-provided migration transform failed; callers may retry after fixing it. */
 export class MigrationTransformError extends SafetyViolationError {
   public override readonly cause: unknown;
 
   constructor(fnName: string, column: string, cause: unknown) {
-    super('MIGRATION_TRANSFORM_FAILED', `Migration transform "${fnName}" for "${column}" failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    super('MIGRATION_TRANSFORM_FAILED', `Migration transform "${fnName}" for "${column}" failed: ${describeThrownValue(cause)}`);
     this.name = 'MigrationTransformError';
     this.cause = cause;
     Object.setPrototypeOf(this, MigrationTransformError.prototype);
