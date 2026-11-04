@@ -135,16 +135,22 @@ export class HybridLogicalClock {
     });
   }
 
-  public receive(remoteHlcString: string, physicalTimeMs = Date.now()): string {
+  /** Validate a remote timestamp without advancing the clock. */
+  public validateRemoteHlc(remoteHlcString: string, physicalTimeMs = Date.now()): ParsedHLC {
     const safePhysical = this.validatePhysicalTime(physicalTimeMs);
     const remote = parseHlc(remoteHlcString);
-
     if (remote.wallTimeMs - safePhysical > this.maxDriftMs) {
       throw new SafetyViolationError(
         'HLC_CLOCK_DRIFT_EXCEEDED',
         `Remote HLC (${remote.wallTimeMs}) exceeds local physical time (${safePhysical}) by more than maxDriftMs (${this.maxDriftMs}ms). Rejecting to prevent LWW clock-poisoning attack.`
       );
     }
+    return remote;
+  }
+
+  public receive(remoteHlcString: string, physicalTimeMs = Date.now()): string {
+    const safePhysical = this.validatePhysicalTime(physicalTimeMs);
+    const remote = this.validateRemoteHlc(remoteHlcString, safePhysical);
 
     if (safePhysical > this.lastWallTimeMs && safePhysical > remote.wallTimeMs) {
       this.lastWallTimeMs = safePhysical;

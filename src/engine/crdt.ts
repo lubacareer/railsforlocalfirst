@@ -87,6 +87,11 @@ export class CrdtTableStore {
     return [...this.conflictLog];
   }
 
+  /** Restore the conflict log after a rejected atomic operation. */
+  public truncateConflictLog(length: number): void {
+    this.conflictLog.length = length;
+  }
+
   public takeSnapshot(): Map<string, CrdtRowState> {
     const snap = new Map<string, CrdtRowState>();
     for (const [pk, state] of this.rows.entries()) {
@@ -300,7 +305,7 @@ export class CrdtTableStore {
         }
       }
 
-      const generatedSql = this.registry.compileSqlForRange(
+      const migrationPlan = this.registry.compileMigrationPlan(
         fromVersion,
         targetVersion,
         dialect
@@ -318,7 +323,7 @@ export class CrdtTableStore {
           upcastedOutboxCount,
           preservedVaultFieldCount,
           restoredFromVaultFieldCount,
-          generatedSql,
+          migrationPlan,
         },
         upcastedOutbox,
       };

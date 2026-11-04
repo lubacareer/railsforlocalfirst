@@ -6,7 +6,8 @@ import {
   SafetyViolationError,
 } from './safety';
 import {
-  compileMigrationOperationSql,
+  compileMigrationOperationPlan,
+  compileVaultRestorationPlan,
   defaultZeroForType,
   evolveTableSchema,
   validateTableSchema,
@@ -17,8 +18,8 @@ import type {
   CrdtRowState,
   MigrationReport,
   MigrationStep,
-  ScalarValue,
   SqlDialect,
+  SqlMigrationPlanStep,
   TableSchema,
   UnmappedVaultEntry,
 } from './types';
@@ -129,21 +130,26 @@ export class SchemaMigrationRegistry {
     return steps;
   }
 
-  public compileSqlForRange(
+  /** Ordered SQL and application steps; all steps must run in one transaction. */
+  public compileMigrationPlan(
     fromVersion: number,
     toVersion: number,
     dialect: SqlDialect
-  ): readonly string[] {
+  ): readonly SqlMigrationPlanStep[] {
     const steps = this.getStepsBetween(fromVersion, toVersion);
-    const statements: string[] = [];
-
+    const plan: SqlMigrationPlanStep[] = [];
     for (const step of steps) {
-      statements.push(`-- Migration v${step.fromVersion} -> v${step.toVersion}: ${step.description}`);
+      let currentSchema = this.getSchemaAtVersion(step.fromVersion);
       for (const op of step.operations) {
-        statements.push(...compileMigrationOperationSql(op, dialect));
+        if (op.table !== this.getTableName()) continue;
+        const nextSchema = evolveTableSchema(currentSchema, step.toVersion, [op]);
+        plan.push(...compileMigrationOperationPlan(op, dialect, step.fromVersion, nextSchema, currentSchema));
+        currentSchema = nextSchema;
       }
+      plan.push(...compileVaultRestorationPlan(currentSchema, dialect));
+      plan.push({ kind: 'sql', statement: `UPDATE "${this.getTableName()}" SET "_schema_version" = ${step.toVersion};` });
     }
-    return statements;
+    return plan;
   }
 
   /**
@@ -183,11 +189,13 @@ export class SchemaMigrationRegistry {
 
     for (const step of steps) {
       const targetStepSchema = this.getSchemaAtVersion(step.toVersion);
+      let operationSchema = this.getSchemaAtVersion(step.fromVersion);
 
       for (const op of step.operations) {
         if (op.table !== row.table) {
           continue;
         }
+        const nextOperationSchema = evolveTableSchema(operationSchema, step.toVersion, [op]);
 
         switch (op.kind) {
           case 'add_column': {
@@ -276,15 +284,8 @@ export class SchemaMigrationRegistry {
             const colName = assertValidSqlIdentifier(op.column, 'transformed column');
             const existingCell = cells[colName];
             if (existingCell !== undefined) {
-              const plainRow = createSafeRecord<ScalarValue>();
-              for (const [k, cell] of Object.entries(cells)) {
-                plainRow[k] = cell.value;
-              }
-              const transformedValue = op.transform(
-                existingCell.value,
-                Object.freeze({ ...plainRow })
-              );
-              const colSpec = targetStepSchema.columns.find((c) => c.name === colName);
+              const transformedValue = op.transform(existingCell.value);
+              const colSpec = nextOperationSchema.columns.find((c) => c.name === colName);
               const validated = assertSafeScalarValue(
                 transformedValue,
                 colName,
@@ -299,6 +300,7 @@ export class SchemaMigrationRegistry {
             break;
           }
         }
+        operationSchema = nextOperationSchema;
       }
 
       // If any unmapped vault fields now match a valid column in targetStepSchema, restore them
@@ -483,7 +485,7 @@ export function buildMigrationReport(params: {
   upcastedOutboxCount: number;
   preservedVaultFieldCount: number;
   restoredFromVaultFieldCount: number;
-  generatedSql: readonly string[];
+  migrationPlan: readonly SqlMigrationPlanStep[];
 }): MigrationReport {
   return Object.freeze({ ...params });
 }

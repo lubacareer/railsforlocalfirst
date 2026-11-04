@@ -13,19 +13,50 @@ export interface ByoStorageConfig {
   readonly endpointUrl?: string;
 }
 
-const PRIVATE_OR_METADATA_HOST_PATTERNS = [
-  /^localhost$/i,
-  /^127\./,
-  /^10\./,
-  /^192\.168\./,
-  /^172\.(1[6-9]|2\d|3[0-1])\./,
-  /^169\.254\./, // Cloud metadata endpoint SSRF vector
-  /^0\./,
-  /^\[?::1\]?$/,
-  /^\[?fe80:/i,
-  /^\[?fc00:/i,
-  /^\[?fd00:/i,
-];
+function isRestrictedIpv4(octets: readonly number[]): boolean {
+  const [a, b] = octets;
+  return a === 0 || a === 10 || a === 127 ||
+    (a === 100 && b !== undefined && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168);
+}
+
+// URL.hostname canonicalizes IP literals, including IPv4-mapped IPv6, to hex.
+function parseIpv6(hostname: string): readonly number[] {
+  const [left = '', right = ''] = hostname.split('::');
+  const leftGroups = left ? left.split(':').map((part) => Number.parseInt(part, 16)) : [];
+  const rightGroups = right ? right.split(':').map((part) => Number.parseInt(part, 16)) : [];
+  return hostname.includes('::')
+    ? [...leftGroups, ...Array<number>(8 - leftGroups.length - rightGroups.length).fill(0), ...rightGroups]
+    : leftGroups;
+}
+
+function isRestrictedHost(rawHostname: string): boolean {
+  const hostname = rawHostname.toLowerCase().replace(/\.+$/, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname === 'metadata.google.internal') {
+    return true;
+  }
+  if (hostname.startsWith('[') && hostname.endsWith(']')) {
+    const groups = parseIpv6(hostname.slice(1, -1));
+    const first = groups[0]!;
+    const allZeroPrefix = groups.slice(0, 7).every((group) => group === 0);
+    if ((allZeroPrefix && (groups[7] === 0 || groups[7] === 1)) ||
+        (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) {
+      return true;
+    }
+    if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
+      const high = groups[6]!;
+      const low = groups[7]!;
+      return isRestrictedIpv4([high >> 8, high & 255, low >> 8, low & 255]);
+    }
+    return false;
+  }
+  const ipv4 = /^\d+\.\d+\.\d+\.\d+$/.test(hostname)
+    ? hostname.split('.').map(Number)
+    : null;
+  return ipv4 !== null && isRestrictedIpv4(ipv4);
+}
 
 export function validateByoStorageConfig(config: ByoStorageConfig): ByoStorageConfig {
   assertValidStorageKey(config.bucketOrFolderName);
@@ -62,13 +93,11 @@ export function validateByoStorageConfig(config: ByoStorageConfig): ByoStorageCo
     }
 
     const hostname = parsedUrl.hostname;
-    for (const pattern of PRIVATE_OR_METADATA_HOST_PATTERNS) {
-      if (pattern.test(hostname)) {
-        throw new SafetyViolationError(
-          'SSRF_PRIVATE_HOST_BLOCKED',
-          `Endpoint hostname "${hostname}" resolves to a restricted local/private/metadata address.`
-        );
-      }
+    if (isRestrictedHost(hostname)) {
+      throw new SafetyViolationError(
+        'SSRF_PRIVATE_HOST_BLOCKED',
+        `Endpoint hostname "${hostname}" is a restricted local/private/metadata hostname or address.`
+      );
     }
   }
 

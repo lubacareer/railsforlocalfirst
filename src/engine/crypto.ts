@@ -47,15 +47,25 @@ export function base64ToBytes(b64: string): Uint8Array {
   if (typeof b64 !== 'string' || b64.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) {
     throw new SafetyViolationError('INVALID_BASE64', 'Invalid base64 string encoding.');
   }
-  if (typeof Buffer !== 'undefined') {
-    return new Uint8Array(Buffer.from(b64, 'base64'));
+  const padding = b64.length - b64.replace(/=+$/, '').length;
+  const unpaddedLength = b64.length - padding;
+  if (unpaddedLength % 4 === 1 || (padding > 0 &&
+      (b64.length % 4 !== 0 || padding !== (4 - unpaddedLength % 4) % 4))) {
+    throw new SafetyViolationError('INVALID_BASE64', 'Invalid base64 string encoding.');
   }
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
+  try {
+    if (typeof Buffer !== 'undefined') {
+      return new Uint8Array(Buffer.from(b64, 'base64'));
+    }
+    const binary = atob(b64);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  } catch {
+    throw new SafetyViolationError('INVALID_BASE64', 'Invalid base64 string encoding.');
   }
-  return out;
 }
 
 export async function sha256Hex(data: Uint8Array): Promise<string> {
@@ -67,17 +77,6 @@ export async function sha256Hex(data: Uint8Array): Promise<string> {
     .join('');
 }
 
-function constantTimeEqualHex(a: string, b: string): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
 function buildCanonicalAadBytes(params: {
   readonly protocolVersion: number;
   readonly envelopeId: string;
@@ -87,7 +86,6 @@ function buildCanonicalAadBytes(params: {
   readonly minHlc: string;
   readonly maxHlc: string;
   readonly operationCount: number;
-  readonly payloadSha256: string;
 }): Uint8Array {
   const canonical = JSON.stringify([
     params.protocolVersion,
@@ -98,7 +96,6 @@ function buildCanonicalAadBytes(params: {
     params.minHlc,
     params.maxHlc,
     params.operationCount,
-    params.payloadSha256,
   ]);
   return new TextEncoder().encode(canonical);
 }
@@ -191,7 +188,7 @@ export async function encryptSyncOperations(params: {
   }
 
   const plaintextPayload: SyncPlaintextPayload = {
-    protocolVersion: 1,
+    protocolVersion: 2,
     envelopeId: params.envelopeId,
     nodeId: params.nodeId,
     table: params.table,
@@ -209,7 +206,6 @@ export async function encryptSyncOperations(params: {
     );
   }
 
-  const payloadSha256 = await sha256Hex(plaintextBytes);
   const webCrypto = getWebCrypto();
   const salt = webCrypto.getRandomValues(new Uint8Array(SALT_BYTE_LENGTH));
   const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTE_LENGTH));
@@ -217,7 +213,7 @@ export async function encryptSyncOperations(params: {
 
   const key = await deriveAesGcmKey(params.passphrase, salt, iterations, ['encrypt']);
   const aad = buildCanonicalAadBytes({
-    protocolVersion: 1,
+    protocolVersion: 2,
     envelopeId: params.envelopeId,
     nodeId: params.nodeId,
     table: params.table,
@@ -225,7 +221,6 @@ export async function encryptSyncOperations(params: {
     minHlc,
     maxHlc,
     operationCount: params.operations.length,
-    payloadSha256,
   });
 
   const ciphertextBuffer = await webCrypto.subtle.encrypt(
@@ -241,14 +236,13 @@ export async function encryptSyncOperations(params: {
 
   return Object.freeze({
     envelopeId: params.envelopeId,
-    protocolVersion: 1,
+    protocolVersion: 2,
     nodeId: params.nodeId,
     table: params.table,
     schemaVersion: params.schemaVersion,
     minHlc,
     maxHlc,
     operationCount: params.operations.length,
-    payloadSha256,
     kdfSaltBase64: bytesToBase64(salt),
     kdfIterations: iterations,
     ivBase64: bytesToBase64(iv),
@@ -261,7 +255,7 @@ export async function decryptSyncEnvelope(
   envelope: EncryptedSyncEnvelope,
   passphrase: string
 ): Promise<SyncPlaintextPayload> {
-  if (!envelope || envelope.protocolVersion !== 1) {
+  if (!envelope || envelope.protocolVersion !== 2) {
     throw new SafetyViolationError(
       'UNSUPPORTED_PROTOCOL_VERSION',
       `Unsupported envelope protocolVersion: ${String(envelope?.protocolVersion)}.`
@@ -283,10 +277,6 @@ export async function decryptSyncEnvelope(
       'INVALID_OPERATION_COUNT',
       `Invalid envelope operationCount: ${String(envelope.operationCount)}.`
     );
-  }
-
-  if (!/^[0-9a-f]{64}$/.test(envelope.payloadSha256)) {
-    throw new SafetyViolationError('INVALID_PAYLOAD_HASH', 'Invalid SHA-256 hex digest format.');
   }
 
   const salt = base64ToBytes(envelope.kdfSaltBase64);
@@ -313,7 +303,6 @@ export async function decryptSyncEnvelope(
     minHlc: envelope.minHlc,
     maxHlc: envelope.maxHlc,
     operationCount: envelope.operationCount,
-    payloadSha256: envelope.payloadSha256,
   });
 
   const webCrypto = getWebCrypto();
@@ -337,19 +326,12 @@ export async function decryptSyncEnvelope(
   }
 
   const plaintextBytes = new Uint8Array(decryptedBuffer);
-  const computedHash = await sha256Hex(plaintextBytes);
-  if (!constantTimeEqualHex(computedHash, envelope.payloadSha256)) {
-    throw new SafetyViolationError(
-      'PAYLOAD_HASH_MISMATCH',
-      'Decrypted payload SHA-256 digest does not match authenticated header.'
-    );
-  }
-
   const decodedText = new TextDecoder().decode(plaintextBytes);
   const payload = safeJsonParse<SyncPlaintextPayload>(decodedText);
 
   if (
-    payload.protocolVersion !== 1 ||
+    !payload || typeof payload !== 'object' ||
+    payload.protocolVersion !== 2 ||
     payload.envelopeId !== envelope.envelopeId ||
     payload.nodeId !== envelope.nodeId ||
     payload.table !== envelope.table ||

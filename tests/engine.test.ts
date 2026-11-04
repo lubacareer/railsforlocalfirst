@@ -195,9 +195,10 @@ describe('Security & Safety Hardening', () => {
       },
       '001700000000000:0000:node-a',
       '{}',
-      'sqlite'
+      'sqlite',
+      '{}'
     );
-    expect(sqliteUpsert.sql).toContain('VALUES (?, ?, ?, ?, ?, ?, ?)');
+    expect(sqliteUpsert.sql).toContain('VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     expect(sqliteUpsert.sql).not.toContain('DROP TABLE');
     expect(sqliteUpsert.params[1]).toBe("O'Reilly'; DROP TABLE tasks;--");
 
@@ -211,9 +212,10 @@ describe('Security & Safety Hardening', () => {
       },
       '001700000000000:0000:node-a',
       '{}',
-      'postgres'
+      'postgres',
+      '{}'
     );
-    expect(pgUpsert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7)');
+    expect(pgUpsert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8)');
   });
 });
 

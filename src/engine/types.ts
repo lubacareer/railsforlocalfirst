@@ -44,10 +44,8 @@ export interface TransformColumnOperation {
   readonly column: string;
   readonly targetType?: ColumnDataType;
   readonly fnName: string;
-  readonly transform: (
-    value: ScalarValue,
-    row: Readonly<Record<string, ScalarValue>>
-  ) => ScalarValue;
+  /** Pure deterministic value-only transform; sparse operations have no full row context. */
+  readonly transform: (value: ScalarValue) => ScalarValue;
 }
 
 export type MigrationOperation =
@@ -102,7 +100,7 @@ export interface CrdtChangeOperation {
 }
 
 export interface SyncPlaintextPayload {
-  readonly protocolVersion: 1;
+  readonly protocolVersion: 2;
   readonly envelopeId: string;
   readonly nodeId: string;
   readonly table: string;
@@ -114,14 +112,13 @@ export interface SyncPlaintextPayload {
 
 export interface EncryptedSyncEnvelope {
   readonly envelopeId: string;
-  readonly protocolVersion: 1;
+  readonly protocolVersion: 2;
   readonly nodeId: string;
   readonly table: string;
   readonly schemaVersion: number;
   readonly minHlc: string;
   readonly maxHlc: string;
   readonly operationCount: number;
-  readonly payloadSha256: string;
   readonly kdfSaltBase64: string;
   readonly kdfIterations: number;
   readonly ivBase64: string;
@@ -140,6 +137,22 @@ export interface ConflictResolutionEvent {
   readonly reason: string;
 }
 
+/** Execute in order within one transaction. SQL alone does not execute application steps. */
+export type SqlMigrationPlanStep =
+  | { readonly kind: 'sql'; readonly statement: string }
+  | {
+      readonly kind: 'application_transform';
+      readonly operation: TransformColumnOperation;
+      readonly fromVersion: number;
+      readonly toVersion: number;
+      readonly dialect: SqlDialect;
+      /** The application must transform each present cell value, preserve its HLC,
+       * validate against targetSchema and perform any target-type DDL (including
+       * a table rebuild for SQLite), in the surrounding transaction. */
+      readonly sourceSchema: TableSchema;
+      readonly targetSchema: TableSchema;
+    };
+
 export interface MigrationReport {
   readonly table: string;
   readonly fromVersion: number;
@@ -148,13 +161,19 @@ export interface MigrationReport {
   readonly upcastedOutboxCount: number;
   readonly preservedVaultFieldCount: number;
   readonly restoredFromVaultFieldCount: number;
-  readonly generatedSql: readonly string[];
+  readonly migrationPlan: readonly SqlMigrationPlanStep[];
+}
+
+export interface RejectedEnvelope {
+  readonly envelopeId: string;
+  readonly errorCode: string;
 }
 
 export interface SyncCycleReport {
   readonly pushedEnvelopeId: string | null;
   readonly pushedOperationCount: number;
   readonly pulledEnvelopeIds: readonly string[];
+  readonly rejectedEnvelopes: readonly RejectedEnvelope[];
   readonly appliedOperationCount: number;
   readonly upcastedIncomingCount: number;
   readonly preservedFutureFieldCount: number;

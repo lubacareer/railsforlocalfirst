@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   InMemoryByoStorageAdapter,
   LocalFirstSyncEngine,
-  SafetyViolationError,
   SchemaMigrationRegistry,
   type EncryptedSyncEnvelope,
   type MigrationStep,
@@ -119,6 +118,22 @@ export function App(): React.ReactElement {
     setLogs((prev) => [{ id: prev.length + 1, tone, message }, ...prev]);
   }
 
+  function logFailure(step: string, error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error);
+    appendLog('rose', `${step} failed: ${detail}`);
+  }
+
+  function assertNoRejections(result: {
+    readonly rejectedEnvelopes: readonly { readonly envelopeId: string; readonly errorCode: string }[];
+  }): void {
+    if (result.rejectedEnvelopes.length > 0) {
+      const details = result.rejectedEnvelopes
+        .map((entry) => `${entry.envelopeId} (${entry.errorCode})`)
+        .join(', ');
+      throw new Error(`Sync rejected envelopes: ${details}`);
+    }
+  }
+
   function refreshSnapshots(current = simState): void {
     setEnvelopes(current.storage.inspectAllEnvelopes());
   }
@@ -140,8 +155,8 @@ export function App(): React.ReactElement {
         },
         baseTime
       );
-      await fresh.peerOnline.sync(fresh.storage, DEMO_PASSPHRASE, baseTime + 100);
-      await fresh.peerStale.sync(fresh.storage, DEMO_PASSPHRASE, baseTime + 200);
+      assertNoRejections(await fresh.peerOnline.sync(fresh.storage, DEMO_PASSPHRASE, baseTime + 100));
+      assertNoRejections(await fresh.peerStale.sync(fresh.storage, DEMO_PASSPHRASE, baseTime + 200));
 
       // Peer Stale goes offline for 4 months (120 days) on Schema v1 and makes offline edits:
       const fourMonthsLater = baseTime + 120 * 24 * 60 * 60 * 1000;
@@ -185,6 +200,8 @@ export function App(): React.ReactElement {
         'emerald',
         'Step 1 complete: Peer Online upgraded to v3 & pushed E2EE envelope. Peer Stale remained offline on v1 for 120 days with 2 queued v1 mutations.'
       );
+    } catch (error) {
+      logFailure('Seed and diverge', error);
     } finally {
       setBusy(false);
     }
@@ -210,12 +227,17 @@ export function App(): React.ReactElement {
         1_800_500_005_000
       );
 
+      assertNoRejections(syncStale);
+      assertNoRejections(syncOnline);
+
       refreshSnapshots();
       setStepIndex(2);
       appendLog(
         'emerald',
         `Bidirectional E2EE sync complete: Both peers converged on Schema v3 (${syncStale.conflictsResolved.length + syncOnline.conflictsResolved.length} column-level LWW conflicts deterministically resolved, 0 data loss).`
       );
+    } catch (error) {
+      logFailure('Migrate and sync', error);
     } finally {
       setBusy(false);
     }
@@ -235,8 +257,6 @@ export function App(): React.ReactElement {
         ...target,
         schemaVersion: 99,
       };
-      simState.storage.unsafeOverwriteForTamperTest(target.envelopeId, tampered);
-
       const verifierPeer = new LocalFirstSyncEngine({
         nodeId: 'security-auditor-node',
         registry: simState.registry,
@@ -244,20 +264,26 @@ export function App(): React.ReactElement {
       });
 
       try {
-        await verifierPeer.pullFromStorage(simState.storage, DEMO_PASSPHRASE);
-      } catch (err) {
-        // Restore untampered envelope after proving rejection
-        simState.storage.unsafeOverwriteForTamperTest(target.envelopeId, target);
-        if (err instanceof SafetyViolationError) {
-          setTamperStatus(`Blocked: ${err.code} — ${err.message}`);
+        simState.storage.unsafeOverwriteForTamperTest(target.envelopeId, tampered);
+        const result = await verifierPeer.pullFromStorage(simState.storage, DEMO_PASSPHRASE);
+        const rejection = result.rejectedEnvelopes.find(
+          (entry) => entry.envelopeId === target.envelopeId
+        );
+        if (rejection) {
+          setTamperStatus(`Blocked: ${rejection.errorCode}`);
           appendLog(
             'emerald',
-            `Security verification passed: Tampered storage envelope deterministically rejected (${err.code}).`
+            `Security verification passed: Tampered storage envelope rejected (${rejection.errorCode}).`
           );
-          return;
+        } else {
+          setTamperStatus('Error: tampered envelope was not rejected');
+          appendLog('rose', 'Security verification failed: the tampered envelope was not rejected.');
         }
-        throw err;
+      } finally {
+        simState.storage.unsafeOverwriteForTamperTest(target.envelopeId, target);
       }
+    } catch (error) {
+      logFailure('Tamper test', error);
     } finally {
       setBusy(false);
     }
@@ -281,7 +307,7 @@ export function App(): React.ReactElement {
   const onlineRows = simState.peerOnline.listRows();
   const staleRows = simState.peerStale.listRows();
   const staleRawStates = simState.peerStale.listRawRowStates();
-  const migrationSql = simState.registry.compileSqlForRange(1, 3, dialect);
+  const migrationPlan = simState.registry.compileMigrationPlan(1, 3, dialect);
   const sqlSnapshot = simState.peerStale.exportSqlSnapshot(dialect);
 
   return (
@@ -404,7 +430,11 @@ export function App(): React.ReactElement {
             {[
               sqlSnapshot.ddl,
               '',
-              ...migrationSql,
+              ...migrationPlan.map((step) =>
+                step.kind === 'sql'
+                  ? step.statement
+                  : `-- REQUIRED APPLICATION STEP: ${step.operation.fnName} on ${step.operation.table}.${step.operation.column}${step.operation.targetType ? `; change type to ${step.operation.targetType}` : ''} (v${step.fromVersion} → v${step.toVersion})`
+              ),
               '',
               ...sqlSnapshot.upserts.map(
                 (q) => `${q.sql}\n-- Bound Params: ${JSON.stringify(q.params)}`
