@@ -29,7 +29,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
    - Authenticates `protocolVersion`, `envelopeId`, `nodeId`, `table`, `schemaVersion`, `minHlc`, `maxHlc`, `operationCount`, and, in v3, `createdAtIso` as AES-GCM **Additional Authenticated Data (AAD)**. These fields and other envelope metadata remain visible to storage providers.
    - New envelopes use protocol v3. Existing v2 envelopes can be read, but their `createdAtIso` is unauthenticated and must not be trusted. Protocol v1 is unsupported; older clients cannot read v3 envelopes.
    - AAD does not prevent replay or rollback. Processed envelope IDs are suppressed only for the lifetime of one engine instance; the in-memory adapter refuses replacement of an existing ID but does not reject older valid envelopes. Older schema operations are upcast before application.
-   - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope.
+   - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope. A user-provided migration transform that throws produces a retryable `MIGRATION_TRANSFORM_FAILED` rejection; local migrations throw `MigrationTransformError` with the original error as its cause.
    - Each push sends one bounded batch; call it again while the outbox is non-empty. Per-envelope storage read failures remain retryable. Ordinary errors are reported as `STORAGE_READ_FAILED`; `SafetyViolationError` failures retain their specific codes.
 
 4. **SQLite & PostgreSQL CRDT Persistence (`src/engine/sqlStore.ts`)**
@@ -61,3 +61,11 @@ npm run dev
 ```
 
 Open the local address printed by Vite. To run the PostgreSQL integration tests, point `TEST_POSTGRES_URL` at a disposable PostgreSQL database; CI provisions one automatically. The tests create and drop test tables.
+
+## Performance benchmarks
+
+Run `npm run benchmark` to measure representative CRDT merges, migration upcasts, and encrypted envelope creation. For Vitest's machine-readable output, run `npm run benchmark -- --outputJson benchmarks.json`. Each benchmark measures a different operation; compare its results over time on the same testbed rather than comparing different operations to one another.
+
+The separate GitHub Actions benchmark workflow uploads its results as a workflow artifact. On `main` and same-repository pull requests, it also submits results to the public Bencher project `rails-for-local-first` when the repository secret `BENCHER_API_KEY` is configured with a project-scoped `bencher_run_` key. To use a different project, set the `BENCHER_PROJECT` repository variable to its slug. Create the key in Bencher and add it directly as a GitHub Actions secret; never commit or share the key. Fork pull requests run the benchmarks but do not receive or use the secret.
+
+The initial results establish a baseline; no regression threshold is enabled. Benchmark measurements in the public Bencher project are public, and the free plan and CI usage are subject to their respective service limits.

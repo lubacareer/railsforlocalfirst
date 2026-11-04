@@ -1,0 +1,74 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run benchmarks
+        run: npm run benchmark -- --outputJson "$RUNNER_TEMP/benchmarks.json"
+      - name: Save benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-results
+          path: ${{ runner.temp }}/benchmarks.json
+          if-no-files-found: error
+
+  report:
+    needs: benchmark
+    # Never provide credentials to fork PRs. This job does not check out PR code.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Bencher configuration
+        id: bencher_config
+        env:
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+        run: |
+          if [ -n "$BENCHER_API_KEY" ]; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'BENCHER_API_KEY is not configured; skipping report submission.'
+          fi
+      - name: Download benchmark results
+        if: steps.bencher_config.outputs.ready == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: benchmark-results
+          path: ${{ runner.temp }}/benchmark-results
+      - name: Install verified Bencher CLI
+        if: steps.bencher_config.outputs.ready == 'true'
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bencher" https://github.com/bencherdev/bencher/releases/download/v0.6.16/bencher-v0.6.16-linux-x86-64
+          echo "a9e68e29d72cdd3f58b8c6f79e8947e5a913be3fec8c990ab6be15cbbca5cfdf  $RUNNER_TEMP/bencher" | sha256sum --check --status
+          chmod 0755 "$RUNNER_TEMP/bencher"
+      - name: Submit benchmark results to Bencher
+        if: steps.bencher_config.outputs.ready == 'true'
+        env:
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+          BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT || 'rails-for-local-first' }}
+          BENCHER_BRANCH: ${{ github.head_ref || github.ref_name }}
+          BENCHER_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          "$RUNNER_TEMP/bencher" run --project "$BENCHER_PROJECT" --branch "$BENCHER_BRANCH" \
+            --hash "$BENCHER_COMMIT" --testbed github-actions --adapter js_vitest \
+            --file "$RUNNER_TEMP/benchmark-results/benchmarks.json"

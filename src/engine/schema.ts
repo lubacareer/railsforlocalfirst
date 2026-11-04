@@ -3,6 +3,7 @@ import {
   assertSafeScalarValue,
   assertValidSqlIdentifier,
   quoteSqlIdentifier,
+  runMigrationTransform,
   SafetyViolationError,
 } from './safety';
 import type {
@@ -324,7 +325,7 @@ export function evolveTableSchema(
           ...existing,
           type,
           ...(existing.defaultValue === undefined ? {} : {
-            defaultValue: assertSafeScalarValue(op.transform(existing.defaultValue), op.column, type, existing.nullable),
+            defaultValue: assertSafeScalarValue(runMigrationTransform(op.transform, existing.defaultValue, op.fnName, op.column), op.column, type, existing.nullable),
           }),
         };
         break;

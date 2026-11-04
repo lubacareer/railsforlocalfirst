@@ -51,6 +51,27 @@ export class SafetyViolationError extends Error {
   }
 }
 
+/** A caller-provided migration transform failed; callers may retry after fixing it. */
+export class MigrationTransformError extends SafetyViolationError {
+  public override readonly cause: unknown;
+
+  constructor(fnName: string, column: string, cause: unknown) {
+    super('MIGRATION_TRANSFORM_FAILED', `Migration transform "${fnName}" for "${column}" failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'MigrationTransformError';
+    this.cause = cause;
+    Object.setPrototypeOf(this, MigrationTransformError.prototype);
+  }
+}
+
+/** Mark only errors thrown by user-provided code as transform failures. */
+export function runMigrationTransform(transform: (value: ScalarValue) => ScalarValue, value: ScalarValue, fnName: string, column: string): ScalarValue {
+  try {
+    return transform(value);
+  } catch (error) {
+    throw new MigrationTransformError(fnName, column, error);
+  }
+}
+
 export function assertValidSqlIdentifier(identifier: string, context = 'identifier'): string {
   if (typeof identifier !== 'string' || !SQL_IDENTIFIER_REGEX.test(identifier)) {
     throw new SafetyViolationError(

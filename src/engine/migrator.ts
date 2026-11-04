@@ -4,6 +4,7 @@ import {
   assertSafeScalarValue,
   assertValidSqlIdentifier,
   createSafeRecord,
+  runMigrationTransform,
   SafetyViolationError,
 } from './safety';
 import {
@@ -266,7 +267,7 @@ export class SchemaMigrationRegistry {
         const before = this.lineageState(v, i);
         if (before[operation.column]?.id === sourceLineage.id) {
           if (!hasTieValue) { tieValue = value; hasTieValue = true; }
-          value = operation.transform(value);
+          value = runMigrationTransform(operation.transform, value, operation.fnName, operation.column);
         }
       }
     }
@@ -434,7 +435,7 @@ export class SchemaMigrationRegistry {
             const colName = assertValidSqlIdentifier(op.column, 'transformed column');
             const existingCell = cells[colName];
             if (existingCell !== undefined) {
-              const transformedValue = op.transform(existingCell.value);
+              const transformedValue = runMigrationTransform(op.transform, existingCell.value, op.fnName, op.column);
               const colSpec = nextOperationSchema.columns.find((c) => c.name === colName);
               const validated = assertSafeScalarValue(
                 transformedValue,

@@ -239,7 +239,8 @@ export async function listLiveSqlRows(db: SqlDatabaseAdapter, schema: TableSchem
 }
 
 /** Ask SQLite to resolve view dependencies rather than matching SQL text. */
-async function assertSqliteViewsIndependent(tx: SqlTransaction, table: string): Promise<void> {
+async function assertSqliteViewsIndependent(tx: SqlTransaction, tableName: string): Promise<void> {
+  const table = quoteSqlIdentifier(tableName, 'table');
   const readViews = () => tx.query(
     "SELECT 'main' AS source_schema, name, sql FROM sqlite_master WHERE type = 'view' " +
     "UNION ALL SELECT 'temp' AS source_schema, name, sql FROM sqlite_temp_master WHERE type = 'view' " +
@@ -301,7 +302,7 @@ export async function migrateSqlTable(db: SqlDatabaseAdapter, registry: SchemaMi
           throw new SafetyViolationError('SQL_MIGRATION_UNSUPPORTED_DEPENDENCY', 'Foreign keys require a custom migration.');
         }
       }
-      await assertSqliteViewsIndependent(tx, table);
+      await assertSqliteViewsIndependent(tx, source.tableName);
     } else {
       // to_regclass parses SQL identifiers; pass the quoted name so mixed-case
       // names cannot bypass the dependency/security checks.

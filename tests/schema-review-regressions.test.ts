@@ -36,6 +36,18 @@ describe('schema review regressions', () => {
     ] }])).toThrow(/PROTOTYPE_POLLUTION_DETECTED/);
   });
 
+  it.each(['__proto__', 'constructor', 'prototype'])('rejects unsafe migration keys before lookup: %s', name => {
+    const operations: MigrationStep['operations'][number][] = [
+      { kind: 'add_column', table: 'items', column: { name, type: 'TEXT', nullable: true } },
+      { kind: 'drop_column_to_vault', table: 'items', column: name },
+      { kind: 'transform_column', table: 'items', column: name, fnName: 'identity', transform: value => value },
+    ];
+    for (const operation of operations) {
+      expect(() => new SchemaMigrationRegistry(schema, [{ ...transform, operations: [operation] }]))
+        .toThrow(/PROTOTYPE_POLLUTION_DETECTED/);
+    }
+  });
+
   it('transforms defaults when the target type is unchanged', () => {
     const registry = new SchemaMigrationRegistry(schema, [transform]);
     const engine = new LocalFirstSyncEngine({ nodeId: 'node', registry, initialActiveVersion: 1 });
