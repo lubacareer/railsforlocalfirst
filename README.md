@@ -30,7 +30,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
    - New envelopes use protocol v3. Existing v2 envelopes can be read, but their `createdAtIso` is unauthenticated and must not be trusted. Protocol v1 is unsupported; older clients cannot read v3 envelopes.
    - AAD does not prevent replay or rollback. Processed envelope IDs are suppressed only for the lifetime of one engine instance; the in-memory adapter refuses replacement of an existing ID but does not reject older valid envelopes. Older schema operations are upcast before application.
    - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope.
-   - Each push sends one bounded batch; call it again while the outbox is non-empty. A per-envelope storage read failure is reported as `STORAGE_READ_FAILED` and remains retryable.
+   - Each push sends one bounded batch; call it again while the outbox is non-empty. Per-envelope storage read failures remain retryable. Ordinary errors are reported as `STORAGE_READ_FAILED`; `SafetyViolationError` failures retain their specific codes.
 
 4. **SQLite & PostgreSQL CRDT Persistence (`src/engine/sqlStore.ts`)**
    - `exportSqlSnapshot` returns table DDL and full CRDT row states, including deleted rows. Use `mergeSqlRowState` with `createSqliteAdapter` or `createPostgresAdapter` to merge each state under a write transaction; use `listLiveSqlRows` to read non-deleted rows. The application supplies the database connection and persists its outbox separately.

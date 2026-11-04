@@ -13,7 +13,14 @@ jobs:
       TEST_POSTGRES_URL: postgresql://rails_test:rails_test@127.0.0.1:5432/rails_test
       REQUIRE_POSTGRES_TESTS: '1'
     steps:
-      - checkout
+      # This repository is public; HTTPS avoids depending on a project SSH key.
+      - run:
+          name: Checkout commit
+          command: |
+            git init
+            git remote add origin "https://github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}.git"
+            git fetch --depth=1 origin "$CIRCLE_SHA1"
+            git checkout --detach FETCH_HEAD
       - run:
           name: Install dependencies
           command: npm ci

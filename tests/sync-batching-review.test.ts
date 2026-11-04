@@ -108,10 +108,22 @@ describe('sync batch and storage regressions', () => {
     const operation = makeRemote('row', 'bad');
     operation.columns.id = { value: 'other', hlc: remoteClock };
     const storage = new InMemoryByoStorageAdapter();
-    await storage.putEnvelope(await makeEnvelope('mismatch', operation));
+    await storage.putEnvelope(await encryptSyncOperations({
+      envelopeId: 'mismatch', nodeId: 'remote', table: 'tasks', schemaVersion: 1,
+      operations: [makeRemote('valid', 'applied first'), makeRemote('existing', 'incoming'), operation],
+      passphrase: password, kdfIterations: MIN_KDF_ITERATIONS,
+    }));
     const engine = makeEngine();
-    expect((await engine.pullFromStorage(storage, password, 1000)).rejectedEnvelopes)
-      .toEqual([{ envelopeId: 'mismatch', errorCode: 'PRIMARY_KEY_MISMATCH' }]);
+    engine.upsert('existing', { title: 'original' }, 900);
+    const conflictsBefore = [...engine.getConflictLog()];
+    const rejected = await engine.pullFromStorage(storage, password, 1000);
+    expect(rejected.rejectedEnvelopes).toEqual([{ envelopeId: 'mismatch', errorCode: 'PRIMARY_KEY_MISMATCH' }]);
+    expect(engine.getRow('valid')).toBeNull();
+    expect(engine.getRow('row')).toBeNull();
+    expect(engine.getRow('existing')?.title).toBe('original');
+    expect(engine.getConflictLog()).toEqual(conflictsBefore);
+    expect(rejected.conflictsResolved).toEqual([]);
+    expect(rejected.appliedOperationCount).toBe(0);
     expect((await engine.pullFromStorage(storage, password, 1000)).rejectedEnvelopes).toEqual([]);
     engine.retryRejectedEnvelopes('mismatch');
     expect((await engine.pullFromStorage(storage, password, 1000)).rejectedEnvelopes).toHaveLength(1);
