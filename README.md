@@ -15,22 +15,25 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
    - Evolves in-memory CRDT tables across multi-step migrations (`add_column`, `rename_column`, `drop_column_to_vault`, `transform_column`) with snapshot rollback on an error. This does not execute database transactions; callers must provide durable persistence for rows and the outbox.
    - Automatically upcasts queued offline CRDT outbox mutations from `v1 -> vN` before syncing.
    - Uses epoch-zero HLC (`000000000000000:0000:schema-default`) for schema defaults so explicit user edits from any peer always beat synthetic migration defaults.
-   - **Forward-Compatibility Vault (`_unmapped_vault`)**: Preserves dropped or unrecognized future columns (when a `v1` client receives a `v3` peer update before upgrading) and restores them automatically upon schema upgrade.
+   - **Forward-Compatibility Vault (`_unmapped_vault`)**: Preserves incompatible and unknown future fields with their schema provenance. A field is restored only when its lineage is known. Reusing a dropped column name creates a new field unless `add_column.restoreFrom` explicitly identifies the archived lineage. Ambiguous legacy entries remain in the vault for explicit mapping.
+   - `mapLegacyVaultEntry` maps an ambiguous entry on a single engine instance after the caller determines its provenance. Mapping is local-only: apply it to every persisted peer copy because vault removals are not currently synchronized.
 
 2. **Join-Semilattice Column-Level CRDT + Hybrid Logical Clock (`src/engine/crdt.ts`, `src/engine/hlc.ts`)**
    - Monotonic Hybrid Logical Clock (`<15-digit-wallTimeMs>:<4-hex-counter>:<nodeId>`) with configurable maximum drift bounds (`maxDriftMs`) to block rogue future-clock poisoning attacks.
    - Commutative, associative, and idempotent LWW register resolution per column and tombstone register for deletions.
+   - New cells preserve their original value as a tie-break key across transforms. Older data without this metadata uses its received value as the fallback, so its original tie order cannot always be recovered after a transform.
 
 3. **Authenticated E2EE BYO-Storage Sync (`src/engine/crypto.ts`, `src/engine/storage.ts`)**
    - Encrypts sync batches using WebCrypto `AES-256-GCM` with 96-bit CSPRNG IVs, 128-bit authentication tags, and `PBKDF2-SHA256` (`210,000` default iterations).
-   - Authenticates `protocolVersion`, `envelopeId`, `nodeId`, `table`, `schemaVersion`, `minHlc`, `maxHlc`, and `operationCount` as AES-GCM **Additional Authenticated Data (AAD)**, detecting changes to those headers. These fields and other envelope metadata remain visible to storage providers.
-   - Protocol v2 removes the public plaintext hash. Protocol v1 envelopes are incompatible and must be regenerated; older clients cannot read v2 envelopes.
+   - Authenticates `protocolVersion`, `envelopeId`, `nodeId`, `table`, `schemaVersion`, `minHlc`, `maxHlc`, `operationCount`, and, in v3, `createdAtIso` as AES-GCM **Additional Authenticated Data (AAD)**. These fields and other envelope metadata remain visible to storage providers.
+   - New envelopes use protocol v3. Existing v2 envelopes can be read, but their `createdAtIso` is unauthenticated and must not be trusted. Protocol v1 is unsupported; older clients cannot read v3 envelopes.
    - AAD does not prevent replay or rollback. Processed envelope IDs are suppressed only for the lifetime of one engine instance; the in-memory adapter refuses replacement of an existing ID but does not reject older valid envelopes. Older schema operations are upcast before application.
    - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope.
 
-4. **SQLite & PostgreSQL Parameterized Compiler (`src/engine/schema.ts`)**
-   - Strict regex/keyword validation on all SQL identifiers (`assertValidSqlIdentifier`) and parameterized upsert values (`?` for SQLite, `$1..$n` for PostgreSQL). SQL migration plans may require application-side steps; SQL statements alone are not a complete migration when a plan includes those steps.
-   - SQL snapshots store per-column HLCs in `_column_hlcs`. Snapshots created before this metadata was added must be regenerated; row-level HLCs cannot reconstruct per-column clocks. Execute every step returned by `compileMigrationPlan` transactionally, including application transform and type-change steps.
+4. **SQLite & PostgreSQL CRDT Persistence (`src/engine/sqlStore.ts`)**
+   - `exportSqlSnapshot` returns table DDL and full CRDT row states, including deleted rows. Use `mergeSqlRowState` with `createSqliteAdapter` or `createPostgresAdapter` to merge each state under a write transaction; use `listLiveSqlRows` to read non-deleted rows. The application supplies the database connection and persists its outbox separately.
+   - `migrateSqlTable` executes registered migrations transactionally by upcasting and rebuilding engine-managed tables. Tables with unsupported dependencies require a custom migration. Snapshots missing causal metadata must be regenerated from live CRDT state; old SQL snapshots cannot recover missing tombstones or lineage.
+   - SQL identifiers are validated and values are parameterized. Migration plans identify required application migration steps rather than presenting SQL alone as a complete migration.
 
 ---
 
@@ -45,10 +48,14 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
 
 ## Quickstart
 
+Install Node.js 20.19 or later in the 20.x series, or Node.js 22.12 or later, and use a modern browser. npm is included with Node.js. The demo uses in-memory storage and does not require a PostgreSQL server or cloud account.
+
 ```bash
-npm install
+npm ci
 npm run typecheck
 npm test
 npm run build
 npm run dev
 ```
+
+Open the local address printed by Vite. To run the PostgreSQL integration tests, point `TEST_POSTGRES_URL` at a disposable PostgreSQL database; CI provisions one automatically. The tests create and drop test tables.

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   compareHlc,
   compileCreateTableSql,
-  compileParameterizedUpsert,
+  compileParameterizedInsert,
   CrdtTableStore,
   decryptSyncEnvelope,
   encryptSyncOperations,
@@ -185,7 +185,7 @@ describe('Security & Safety Hardening', () => {
   });
 
   it('generates parameterized SQLite and PostgreSQL queries without raw value interpolation', () => {
-    const sqliteUpsert = compileParameterizedUpsert(
+    const sqliteUpsert = compileParameterizedInsert(
       SCHEMA_V1,
       {
         id: 'task-1',
@@ -198,11 +198,11 @@ describe('Security & Safety Hardening', () => {
       'sqlite',
       '{}'
     );
-    expect(sqliteUpsert.sql).toContain('VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    expect(sqliteUpsert.sql).toContain('VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     expect(sqliteUpsert.sql).not.toContain('DROP TABLE');
     expect(sqliteUpsert.params[1]).toBe("O'Reilly'; DROP TABLE tasks;--");
 
-    const pgUpsert = compileParameterizedUpsert(
+    const pgUpsert = compileParameterizedInsert(
       SCHEMA_V1,
       {
         id: 'task-1',
@@ -215,7 +215,7 @@ describe('Security & Safety Hardening', () => {
       'postgres',
       '{}'
     );
-    expect(pgUpsert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8)');
+    expect(pgUpsert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)');
   });
 });
 

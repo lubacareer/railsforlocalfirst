@@ -4,6 +4,7 @@ import {
   SafetyViolationError,
 } from './safety';
 import type { EncryptedSyncEnvelope, StorageAdapter } from './types';
+import { compareHlc, parseHlc } from './hlc';
 
 export type ByoProviderKind = 's3-compatible' | 'icloud-drive' | 'google-drive' | 'memory';
 
@@ -14,12 +15,15 @@ export interface ByoStorageConfig {
 }
 
 function isRestrictedIpv4(octets: readonly number[]): boolean {
-  const [a, b] = octets;
+  const [a, b, c] = octets;
   return a === 0 || a === 10 || a === 127 ||
     (a === 100 && b !== undefined && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168);
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 0) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a !== undefined && a >= 224);
 }
 
 // URL.hostname canonicalizes IP literals, including IPv4-mapped IPv6, to hex.
@@ -42,7 +46,11 @@ function isRestrictedHost(rawHostname: string): boolean {
     const first = groups[0]!;
     const allZeroPrefix = groups.slice(0, 7).every((group) => group === 0);
     if ((allZeroPrefix && (groups[7] === 0 || groups[7] === 1)) ||
-        (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) {
+        (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
+        groups.slice(0, 6).every((group) => group === 0) || // IPv4-compatible IPv6
+        (first === 0x64 && groups[1] === 0xff9b && groups.slice(2, 6).every((group) => group === 0)) ||
+        first === 0x2002 || // 6to4
+        (first === 0x2001 && groups[1] === 0)) { // Teredo
       return true;
     }
     if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
@@ -150,8 +158,15 @@ export class InMemoryByoStorageAdapter implements StorageAdapter {
       }
     }
     matching.sort((a, b) => {
-      if (a.minHlc !== b.minHlc) {
-        return a.minHlc < b.minHlc ? -1 : 1;
+      // Invalid untrusted headers must not make listing fail; sort them last.
+      let aValid = true;
+      let bValid = true;
+      try { parseHlc(a.minHlc); } catch { aValid = false; }
+      try { parseHlc(b.minHlc); } catch { bValid = false; }
+      if (aValid !== bValid) return aValid ? -1 : 1;
+      if (aValid && bValid) {
+        const order = compareHlc(a.minHlc, b.minHlc);
+        if (order !== 0) return order;
       }
       return a.envelopeId < b.envelopeId ? -1 : a.envelopeId > b.envelopeId ? 1 : 0;
     });

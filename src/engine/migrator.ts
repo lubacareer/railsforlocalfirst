@@ -1,4 +1,4 @@
-import { compareHlc, formatHlc } from './hlc';
+import { formatHlc } from './hlc';
 import {
   assertSafeScalarValue,
   assertValidSqlIdentifier,
@@ -6,12 +6,11 @@ import {
   SafetyViolationError,
 } from './safety';
 import {
-  compileMigrationOperationPlan,
-  compileVaultRestorationPlan,
   defaultZeroForType,
   evolveTableSchema,
   validateTableSchema,
 } from './schema';
+import { canonicalHlc, cellWins, flattenVaultEntry, mergeVaultEntries, packVaultEntries, validateVaultEntry } from './vault';
 import type {
   CrdtCell,
   CrdtChangeOperation,
@@ -23,6 +22,8 @@ import type {
   TableSchema,
   UnmappedVaultEntry,
 } from './types';
+
+type LineageState = Record<string, { readonly id: string; readonly revision: number }>;
 
 /**
  * Epoch-zero HLC used for schema-migration default values so that any real user
@@ -81,6 +82,22 @@ export class SchemaMigrationRegistry {
     this.stepsByFromVersion.set(step.fromVersion, step);
     this.schemasByVersion.set(step.toVersion, nextSchema);
     this.maxVersion = step.toVersion;
+    try {
+      for (const op of step.operations) {
+        if (op.kind === 'add_column' && op.restoreFrom) {
+          assertValidSqlIdentifier(op.restoreFrom.column, 'restored column');
+          if (!Number.isSafeInteger(op.restoreFrom.version) || op.restoreFrom.version < this.initialSchema.version || op.restoreFrom.version > step.fromVersion) {
+            throw new SafetyViolationError('UNKNOWN_RESTORED_LINEAGE', 'restoreFrom must identify a field in an earlier registered schema.');
+          }
+        }
+      }
+      this.lineageState(step.toVersion);
+    } catch (error) {
+      this.stepsByFromVersion.delete(step.fromVersion);
+      this.schemasByVersion.delete(step.toVersion);
+      this.maxVersion = step.fromVersion;
+      throw error;
+    }
   }
 
   public getTableName(): string {
@@ -137,19 +154,145 @@ export class SchemaMigrationRegistry {
     dialect: SqlDialect
   ): readonly SqlMigrationPlanStep[] {
     const steps = this.getStepsBetween(fromVersion, toVersion);
-    const plan: SqlMigrationPlanStep[] = [];
-    for (const step of steps) {
-      let currentSchema = this.getSchemaAtVersion(step.fromVersion);
-      for (const op of step.operations) {
-        if (op.table !== this.getTableName()) continue;
-        const nextSchema = evolveTableSchema(currentSchema, step.toVersion, [op]);
-        plan.push(...compileMigrationOperationPlan(op, dialect, step.fromVersion, nextSchema, currentSchema));
-        currentSchema = nextSchema;
-      }
-      plan.push(...compileVaultRestorationPlan(currentSchema, dialect));
-      plan.push({ kind: 'sql', statement: `UPDATE "${this.getTableName()}" SET "_schema_version" = ${step.toVersion};` });
+    return steps.map((step) => ({
+      kind: 'application_migration' as const,
+      step,
+      sourceSchema: this.getSchemaAtVersion(step.fromVersion),
+      targetSchema: this.getSchemaAtVersion(step.toVersion),
+      dialect,
+    }));
+  }
+
+  /** Reconstruct stable field identities and representation revisions at a schema position. */
+  private lineageState(version: number, position: number | 'end' = 'end'): LineageState {
+    this.getSchemaAtVersion(version);
+    const initial: LineageState = createSafeRecord();
+    for (const col of this.initialSchema.columns) {
+      initial[col.name] = { id: `v${this.initialSchema.version}:base:${col.name}`, revision: 0 };
     }
-    return plan;
+    const history = new Map<number, LineageState>([[this.initialSchema.version, { ...initial }]]);
+    const current: LineageState = { ...initial };
+    const revisions = new Map(Object.values(initial).map((lineage) => [lineage.id, lineage.revision]));
+    if (version === this.initialSchema.version) {
+      if (position !== 'end') throw new SafetyViolationError('INVALID_SCHEMA_POSITION', 'Initial schema has no migration operations.');
+      return current;
+    }
+    for (const step of this.getStepsBetween(this.initialSchema.version, version)) {
+      const limit = step.toVersion === version && position !== 'end' ? position : step.operations.length;
+      if (!Number.isSafeInteger(limit) || limit < 0 || limit > step.operations.length) {
+        throw new SafetyViolationError('INVALID_SCHEMA_POSITION', 'Schema position is outside its migration step.');
+      }
+      for (let i = 0; i < limit; i++) {
+        const op = step.operations[i]!;
+        if (op.table !== this.getTableName()) continue;
+        switch (op.kind) {
+          case 'add_column': {
+            if (op.restoreFrom) {
+              const restored = history.get(op.restoreFrom.version)?.[op.restoreFrom.column];
+              if (!restored) throw new SafetyViolationError('UNKNOWN_RESTORED_LINEAGE', 'restoreFrom must identify a field in an earlier registered schema.');
+              if (Object.values(current).some((active) => active.id === restored.id)) {
+                throw new SafetyViolationError('ACTIVE_RESTORED_LINEAGE', 'Cannot restore a lineage that is already active.');
+              }
+              current[op.column.name] = { ...restored, revision: revisions.get(restored.id) ?? restored.revision };
+            } else {
+              current[op.column.name] = { id: `v${step.toVersion}:op${i}:${op.column.name}`, revision: 0 };
+              revisions.set(current[op.column.name]!.id, 0);
+            }
+            break;
+          }
+          case 'rename_column': {
+            const prior = current[op.from];
+            if (prior) current[op.to] = prior;
+            delete current[op.from];
+            break;
+          }
+          case 'drop_column_to_vault': delete current[op.column]; break;
+          case 'transform_column': {
+            const prior = current[op.column];
+            if (prior) {
+              current[op.column] = { ...prior, revision: prior.revision + 1 };
+              revisions.set(prior.id, prior.revision + 1);
+            }
+            break;
+          }
+        }
+      }
+      history.set(step.toVersion, { ...current });
+    }
+    return current;
+  }
+
+  private upcastVaultValue(field: string, entry: UnmappedVaultEntry, targetVersion: number): { column: string; cell: CrdtCell } | null {
+    if (entry.schemaPosition === undefined || entry.sourceVersion > targetVersion || entry.sourceVersion > this.maxVersion) return null;
+    let source: LineageState;
+    try { source = this.lineageState(entry.sourceVersion, entry.schemaPosition); } catch (error) {
+      if (error instanceof SafetyViolationError && (error.code === 'INVALID_SCHEMA_POSITION' || error.code === 'UNKNOWN_SCHEMA_VERSION')) return null;
+      throw error;
+    }
+    const sourceLineage = source[field];
+    if (!sourceLineage || (entry.lineageId !== undefined && entry.lineageId !== sourceLineage.id)) return null;
+    const target = this.lineageState(targetVersion);
+    const destination = Object.entries(target).find(([, state]) => state.id === sourceLineage.id);
+    if (!destination) return null;
+    let value = entry.value;
+    let tieValue = entry.tieValue;
+    let hasTieValue = Object.prototype.hasOwnProperty.call(entry, 'tieValue');
+    for (let v = entry.sourceVersion; v <= targetVersion; v++) {
+      const step = this.stepsByFromVersion.get(v - 1);
+      if (!step) continue;
+      const start = v === entry.sourceVersion ? (entry.schemaPosition === 'end' ? step.operations.length : entry.schemaPosition) : 0;
+      for (let i = start; i < step.operations.length; i++) {
+        const operation = step.operations[i]!;
+        if (operation.table !== this.getTableName() || operation.kind !== 'transform_column') continue;
+        const before = this.lineageState(v, i);
+        if (before[operation.column]?.id === sourceLineage.id) {
+          if (!hasTieValue) { tieValue = value; hasTieValue = true; }
+          value = operation.transform(value);
+        }
+      }
+    }
+    const col = this.getSchemaAtVersion(targetVersion).columns.find((c) => c.name === destination[0])!;
+    return { column: col.name, cell: { value: assertSafeScalarValue(value, col.name, col.type, col.nullable), hlc: entry.hlc,
+      ...(hasTieValue && { tieValue: tieValue! }) } };
+  }
+
+  private reconcileVault(cells: Record<string, CrdtCell>, vault: Record<string, UnmappedVaultEntry>, version: number): number {
+    let count = 0;
+    for (const [field, packed] of Object.entries(vault)) {
+      const remaining: UnmappedVaultEntry[] = [];
+      for (const entry of flattenVaultEntry(packed)) {
+        const restored = this.upcastVaultValue(field, entry, version);
+        if (!restored) { remaining.push(entry); continue; }
+        const current = cells[restored.column];
+        if (!current || cellWins(restored.cell, current)) cells[restored.column] = restored.cell;
+        count++;
+      }
+      const rest = packVaultEntries(remaining);
+      if (rest) vault[field] = rest;
+      else delete vault[field];
+    }
+    return count;
+  }
+
+  /** Explicitly assign provenance to one ambiguous legacy entry; no value is guessed. */
+  public mapLegacyVaultEntry(row: CrdtRowState, field: string, legacyIndex: number, sourceVersion: number, schemaPosition: number | 'end'): CrdtRowState {
+    assertValidSqlIdentifier(field, 'unmapped field');
+    const result = cloneRowState(row);
+    const packed = result.unmappedFields[field];
+    if (!packed || !Number.isSafeInteger(legacyIndex) || legacyIndex < 0) {
+      throw new SafetyViolationError('INVALID_VAULT_ENTRY', 'Legacy vault entry not found.');
+    }
+    const entries = flattenVaultEntry(packed);
+    const selected = entries[legacyIndex];
+    if (!selected || selected.schemaPosition !== undefined) {
+      throw new SafetyViolationError('INVALID_VAULT_ENTRY', 'Selected vault entry is not ambiguous legacy data.');
+    }
+    const lineage = this.lineageState(sourceVersion, schemaPosition)[field];
+    if (!lineage) throw new SafetyViolationError('UNKNOWN_RESTORED_LINEAGE', 'No field exists at the specified schema position.');
+    entries[legacyIndex] = { ...selected, sourceVersion, schemaPosition, lineageId: lineage.id };
+    result.unmappedFields[field] = packVaultEntries(entries)!;
+    this.reconcileVault(result.cells, result.unmappedFields, row.schemaVersion);
+    return result;
   }
 
   /**
@@ -172,26 +315,27 @@ export class SchemaMigrationRegistry {
     }
 
     if (row.schemaVersion === targetVersion) {
+      const copy = cloneRowState(row);
+      const restoredVaultDelta = this.reconcileVault(copy.cells, copy.unmappedFields, targetVersion);
       return {
-        row: cloneRowState(row),
+        row: copy,
         preservedVaultDelta: 0,
-        restoredVaultDelta: 0,
+        restoredVaultDelta,
       };
     }
 
     const steps = this.getStepsBetween(row.schemaVersion, targetVersion);
-    let cells = createSafeRecord<CrdtCell>(Object.entries(row.cells));
+    let cells = createSafeRecord<CrdtCell>(Object.entries(row.cells).map(([name, cell]) => [name, { ...cell, hlc: canonicalHlc(cell.hlc) }]));
     let unmappedFields = createSafeRecord<UnmappedVaultEntry>(
-      Object.entries(row.unmappedFields)
+      Object.entries(row.unmappedFields).map(([name, entry]) => [name, mergeVaultEntries(undefined, entry)])
     );
     let preservedVaultDelta = 0;
     let restoredVaultDelta = 0;
 
     for (const step of steps) {
-      const targetStepSchema = this.getSchemaAtVersion(step.toVersion);
       let operationSchema = this.getSchemaAtVersion(step.fromVersion);
 
-      for (const op of step.operations) {
+      for (const [operationIndex, op] of step.operations.entries()) {
         if (op.table !== row.table) {
           continue;
         }
@@ -200,22 +344,7 @@ export class SchemaMigrationRegistry {
         switch (op.kind) {
           case 'add_column': {
             const colName = assertValidSqlIdentifier(op.column.name, 'column');
-            const vaultEntry = unmappedFields[colName];
-
-            if (vaultEntry !== undefined) {
-              const validated = assertSafeScalarValue(
-                vaultEntry.value,
-                colName,
-                op.column.type,
-                op.column.nullable
-              );
-              cells[colName] = {
-                value: validated,
-                hlc: vaultEntry.hlc,
-              };
-              delete unmappedFields[colName];
-              restoredVaultDelta += 1;
-            } else if (
+            if (
               op.backfillFromColumn &&
               cells[op.backfillFromColumn] !== undefined
             ) {
@@ -227,8 +356,8 @@ export class SchemaMigrationRegistry {
                 op.column.nullable
               );
               cells[colName] = {
+                ...sourceCell,
                 value: validated,
-                hlc: sourceCell.hlc,
               };
             } else {
               const fallbackValue =
@@ -266,14 +395,15 @@ export class SchemaMigrationRegistry {
             const droppedCol = assertValidSqlIdentifier(op.column, 'dropped column');
             const existingCell = cells[droppedCol];
             if (existingCell !== undefined) {
-              const existingVault = unmappedFields[droppedCol];
-              if (!existingVault || compareHlc(existingCell.hlc, existingVault.hlc) >= 0) {
-                unmappedFields[droppedCol] = {
-                  value: existingCell.value,
-                  hlc: existingCell.hlc,
-                  sourceVersion: step.fromVersion,
-                };
-              }
+              const lineage = this.lineageState(step.toVersion, operationIndex)[droppedCol];
+              unmappedFields[droppedCol] = mergeVaultEntries(unmappedFields[droppedCol], {
+                value: existingCell.value,
+                hlc: existingCell.hlc,
+                ...(Object.prototype.hasOwnProperty.call(existingCell, 'tieValue') && { tieValue: existingCell.tieValue }),
+                sourceVersion: step.toVersion,
+                schemaPosition: operationIndex,
+                ...(lineage && { lineageId: lineage.id }),
+              });
               delete cells[droppedCol];
               preservedVaultDelta += 1;
             }
@@ -293,8 +423,9 @@ export class SchemaMigrationRegistry {
                 colSpec?.nullable ?? true
               );
               cells[colName] = {
+                ...existingCell,
                 value: validated,
-                hlc: existingCell.hlc,
+                tieValue: Object.prototype.hasOwnProperty.call(existingCell, 'tieValue') ? existingCell.tieValue! : existingCell.value,
               };
             }
             break;
@@ -303,27 +434,8 @@ export class SchemaMigrationRegistry {
         operationSchema = nextOperationSchema;
       }
 
-      // If any unmapped vault fields now match a valid column in targetStepSchema, restore them
-      for (const colSpec of targetStepSchema.columns) {
-        const vaultEntry = unmappedFields[colSpec.name];
-        if (vaultEntry !== undefined) {
-          const currentCell = cells[colSpec.name];
-          if (!currentCell || compareHlc(vaultEntry.hlc, currentCell.hlc) >= 0) {
-            const validated = assertSafeScalarValue(
-              vaultEntry.value,
-              colSpec.name,
-              colSpec.type,
-              colSpec.nullable
-            );
-            cells[colSpec.name] = {
-              value: validated,
-              hlc: vaultEntry.hlc,
-            };
-          }
-          delete unmappedFields[colSpec.name];
-          restoredVaultDelta += 1;
-        }
-      }
+      // Restore only after the complete step: future-form values must not run its transforms twice.
+      restoredVaultDelta += this.reconcileVault(cells, unmappedFields, step.toVersion);
     }
 
     return {
@@ -331,7 +443,7 @@ export class SchemaMigrationRegistry {
         pk: row.pk,
         table: row.table,
         schemaVersion: targetVersion,
-        tombstoneHlc: row.tombstoneHlc,
+      tombstoneHlc: row.tombstoneHlc === null ? null : canonicalHlc(row.tombstoneHlc),
         cells,
         unmappedFields,
       },
@@ -352,6 +464,10 @@ export class SchemaMigrationRegistry {
     readonly wasUpcasted: boolean;
     readonly preservedFutureFieldCount: number;
   } {
+    for (const [field, cell] of Object.entries(op.columns)) {
+      if (Object.prototype.hasOwnProperty.call(cell, 'tieValue')) assertSafeScalarValue(cell.tieValue, `${field} tie value`);
+    }
+    for (const [field, entry] of Object.entries(op.unmappedFields ?? {})) validateVaultEntry(entry, field);
     if (op.table !== this.initialSchema.tableName) {
       throw new SafetyViolationError(
         'TABLE_MISMATCH',
@@ -410,7 +526,8 @@ export class SchemaMigrationRegistry {
     // Case 2: Operation is from a NEWER schema version (peer is ahead of local client)
     // Preserve any unrecognized columns in unmappedFields so zero data is lost!
     const targetSchema = this.getSchemaAtVersion(targetVersion);
-    const knownColumns = new Set(targetSchema.columns.map((c) => c.name));
+    const sourceLineages = op.schemaVersion <= this.maxVersion ? this.lineageState(op.schemaVersion) : null;
+    const targetLineages = this.lineageState(targetVersion);
     const recognizedCells = createSafeRecord<CrdtCell>();
     const unmappedFields = createSafeRecord<UnmappedVaultEntry>(
       op.unmappedFields ? Object.entries(op.unmappedFields) : []
@@ -419,27 +536,41 @@ export class SchemaMigrationRegistry {
 
     for (const [colName, cell] of Object.entries(op.columns)) {
       assertValidSqlIdentifier(colName, 'operation column');
-      if (knownColumns.has(colName)) {
-        const colSpec = targetSchema.columns.find((c) => c.name === colName)!;
+      const lineage = sourceLineages?.[colName];
+      const destination = lineage && Object.entries(targetLineages).find(([, candidate]) =>
+        candidate.id === lineage.id && candidate.revision === lineage.revision
+      );
+      const targetName = op.schemaVersion === targetVersion
+        ? colName
+        : colName === targetSchema.primaryKey ? colName : destination?.[0];
+      const colSpec = targetSchema.columns.find((c) => c.name === targetName);
+      if (colSpec) {
         const validated = assertSafeScalarValue(
           cell.value,
-          colName,
+          colSpec.name,
           colSpec.type,
           colSpec.nullable
         );
-        recognizedCells[colName] = {
+        recognizedCells[colSpec.name] = {
+          ...cell,
           value: validated,
-          hlc: cell.hlc,
         };
       } else {
-        unmappedFields[colName] = {
+        unmappedFields[colName] = mergeVaultEntries(unmappedFields[colName], {
           value: assertSafeScalarValue(cell.value, colName),
           hlc: cell.hlc,
+          ...(Object.prototype.hasOwnProperty.call(cell, 'tieValue') && { tieValue: cell.tieValue }),
           sourceVersion: op.schemaVersion,
-        };
+          schemaPosition: 'end',
+          ...(lineage && { lineageId: lineage.id }),
+        });
         preservedFutureFieldCount += 1;
       }
     }
+
+    // Vault entries already at or behind this schema can be reconciled even when
+    // the operation itself did not require a schema-version transition.
+    this.reconcileVault(recognizedCells, unmappedFields, targetVersion);
 
     return {
       operation: {
@@ -457,21 +588,17 @@ export class SchemaMigrationRegistry {
 export function cloneRowState(row: CrdtRowState): CrdtRowState {
   const cells = createSafeRecord<CrdtCell>();
   for (const [k, v] of Object.entries(row.cells)) {
-    cells[k] = { value: v.value, hlc: v.hlc };
+    cells[k] = { ...v, hlc: canonicalHlc(v.hlc) };
   }
   const unmappedFields = createSafeRecord<UnmappedVaultEntry>();
   for (const [k, v] of Object.entries(row.unmappedFields)) {
-    unmappedFields[k] = {
-      value: v.value,
-      hlc: v.hlc,
-      sourceVersion: v.sourceVersion,
-    };
+    unmappedFields[k] = mergeVaultEntries(undefined, v);
   }
   return {
     pk: row.pk,
     table: row.table,
     schemaVersion: row.schemaVersion,
-    tombstoneHlc: row.tombstoneHlc,
+    tombstoneHlc: row.tombstoneHlc === null ? null : canonicalHlc(row.tombstoneHlc),
     cells,
     unmappedFields,
   };

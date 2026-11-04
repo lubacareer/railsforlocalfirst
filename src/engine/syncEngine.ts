@@ -1,5 +1,5 @@
-import { CrdtTableStore, isRowTombstoned } from './crdt';
-import { decryptSyncEnvelope, encryptSyncOperations } from './crypto';
+import { CrdtTableStore } from './crdt';
+import { AuthenticatedPayloadError, decryptSyncEnvelope, encryptSyncOperations } from './crypto';
 import { compareHlc, HybridLogicalClock } from './hlc';
 import { SchemaMigrationRegistry } from './migrator';
 import {
@@ -10,7 +10,7 @@ import {
   createSafeRecord,
   SafetyViolationError,
 } from './safety';
-import { compileCreateTableSql, compileParameterizedUpsert } from './schema';
+import { compileCreateTableSql } from './schema';
 import type {
   ConflictResolutionEvent,
   CrdtCell,
@@ -221,7 +221,10 @@ export class LocalFirstSyncEngine {
       columns: createSafeRecord(Object.entries(op.columns).map(([name, cell]) => [name, { ...cell }])),
       ...(op.unmappedFields && {
         unmappedFields: createSafeRecord(
-          Object.entries(op.unmappedFields).map(([name, entry]) => [name, { ...entry }])
+          Object.entries(op.unmappedFields).map(([name, entry]) => [name, {
+            ...entry,
+            ...(entry.alternatives && { alternatives: entry.alternatives.map((item) => ({ ...item })) }),
+          }])
         ),
       }),
     }));
@@ -285,6 +288,7 @@ export class LocalFirstSyncEngine {
       let preEnvelopeVersion = 0;
       let preClockState: ReturnType<HybridLogicalClock['getState']> | undefined;
       let preConflictCount = 0;
+      let authenticated = false;
       let envelopeApplied = 0;
       let envelopeUpcasted = 0;
       let envelopePreserved = 0;
@@ -296,13 +300,23 @@ export class LocalFirstSyncEngine {
           throw new SafetyViolationError('ENVELOPE_ID_MISMATCH', 'Storage returned an envelope with a different ID.');
         }
         const payload = await decryptSyncEnvelope(envelope, passphrase);
+        authenticated = true;
         // Capture only after asynchronous I/O so rollback cannot discard a local
         // edit made while the envelope was being fetched or decrypted.
         preEnvelopeSnapshot = this.store.takeSnapshot();
         preEnvelopeVersion = this.store.getCurrentVersion();
         preClockState = this.clock.getState();
         preConflictCount = this.store.getConflictLog().length;
+        this.clock.validateRemoteHlc(payload.minHlc, physicalTimeMs);
+        if (compareHlc(payload.minHlc, payload.maxHlc) > 0) {
+          throw new SafetyViolationError('INVALID_HLC_BOUNDS', 'Envelope minimum HLC exceeds maximum.');
+        }
+        if (payload.table !== this.getTableName()) {
+          throw new SafetyViolationError('TABLE_MISMATCH', 'Envelope table does not match this engine.');
+        }
         this.clock.receive(payload.maxHlc, physicalTimeMs);
+        let actualMin: string | undefined;
+        let actualMax: string | undefined;
         for (const op of payload.operations) {
           if (!op || typeof op !== 'object' || (op.kind !== 'upsert' && op.kind !== 'delete') ||
               typeof op.opId !== 'string' || typeof op.table !== 'string' || typeof op.nodeId !== 'string' ||
@@ -310,11 +324,23 @@ export class LocalFirstSyncEngine {
               (op.unmappedFields !== undefined && (!op.unmappedFields || typeof op.unmappedFields !== 'object' || Array.isArray(op.unmappedFields)))) {
             throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Malformed sync operation fields.');
           }
-          this.clock.validateRemoteHlc(op.hlc, physicalTimeMs);
+          assertValidNodeId(op.nodeId);
+          const parsed = this.clock.validateRemoteHlc(op.hlc, physicalTimeMs);
+          if (parsed.nodeId !== op.nodeId) {
+            throw new SafetyViolationError('HLC_NODE_MISMATCH', 'Operation node ID must match its HLC origin.');
+          }
+          if (op.table !== payload.table) {
+            throw new SafetyViolationError('TABLE_MISMATCH', 'Operation table does not match its envelope.');
+          }
+          if (compareHlc(op.hlc, payload.minHlc) < 0) {
+            throw new SafetyViolationError('HLC_BELOW_ENVELOPE_MIN', 'Operation HLC precedes the envelope minimum.');
+          }
           if (compareHlc(op.hlc, payload.maxHlc) > 0) {
             throw new SafetyViolationError('HLC_EXCEEDS_ENVELOPE_MAX', 'Operation HLC exceeds the envelope maximum.');
           }
-          for (const cell of [...Object.values(op.columns), ...Object.values(op.unmappedFields ?? {})]) {
+          actualMin = actualMin === undefined || compareHlc(op.hlc, actualMin) < 0 ? op.hlc : actualMin;
+          actualMax = actualMax === undefined || compareHlc(op.hlc, actualMax) > 0 ? op.hlc : actualMax;
+          for (const cell of Object.values(op.columns)) {
             if (!cell || typeof cell !== 'object') {
               throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Malformed sync cell or vault entry.');
             }
@@ -323,11 +349,38 @@ export class LocalFirstSyncEngine {
               throw new SafetyViolationError('HLC_EXCEEDS_OPERATION', 'Cell or vault HLC exceeds its operation HLC.');
             }
           }
+          const validateVault = (raw: unknown, isAlternative = false): void => {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+              throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Malformed vault entry.');
+            }
+            const entry = raw as Record<string, unknown>;
+            if (!Number.isSafeInteger(entry.sourceVersion) || (entry.sourceVersion as number) < 1 ||
+                (entry.lineageId !== undefined && typeof entry.lineageId !== 'string') ||
+                (entry.schemaPosition !== undefined && entry.schemaPosition !== 'end' &&
+                  (!Number.isSafeInteger(entry.schemaPosition) || (entry.schemaPosition as number) < 0))) {
+              throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Malformed vault provenance.');
+            }
+            this.clock.validateRemoteHlc(entry.hlc as string, physicalTimeMs);
+            if (compareHlc(entry.hlc as string, op.hlc) > 0) {
+              throw new SafetyViolationError('HLC_EXCEEDS_OPERATION', 'Vault HLC exceeds its operation HLC.');
+            }
+            if (entry.alternatives !== undefined) {
+              if (isAlternative || !Array.isArray(entry.alternatives)) {
+                throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Vault alternatives must be a flat array.');
+              }
+              for (const alternative of entry.alternatives) validateVault(alternative, true);
+            }
+          };
+          for (const entry of Object.values(op.unmappedFields ?? {})) validateVault(entry);
           const result = this.store.applyOperation(op);
           if (result.applied) envelopeApplied++;
           if (result.wasUpcasted) envelopeUpcasted++;
           envelopePreserved += result.preservedFutureFieldCount;
           envelopeConflicts.push(...result.conflicts);
+        }
+        if (actualMin === undefined || actualMax === undefined ||
+            compareHlc(actualMin, payload.minHlc) !== 0 || compareHlc(actualMax, payload.maxHlc) !== 0) {
+          throw new SafetyViolationError('INVALID_HLC_BOUNDS', 'Envelope HLC bounds must match its operations.');
         }
         this.processedEnvelopeIds.add(envId);
         pulledEnvelopeIds.push(envId);
@@ -343,7 +396,14 @@ export class LocalFirstSyncEngine {
         }
         if (!(err instanceof SafetyViolationError)) throw err;
         rejectedEnvelopes.push({ envelopeId: envId, errorCode: err.code });
-        if (err.code === 'CRYPTO_AUTHENTICATION_FAILED' || err.code === 'PAYLOAD_HASH_MISMATCH') {
+        const permanentSemanticErrors = new Set([
+          'INVALID_SYNC_OPERATION', 'HLC_EXCEEDS_OPERATION', 'HLC_EXCEEDS_ENVELOPE_MAX',
+          'HLC_BELOW_ENVELOPE_MIN', 'INVALID_HLC_BOUNDS', 'HLC_NODE_MISMATCH',
+          'INVALID_NODE_ID', 'TABLE_MISMATCH', 'INVALID_HLC_FORMAT', 'INVALID_HLC_TIMESTAMP',
+          'INVALID_HLC_COUNTER',
+        ]);
+        if (err.code === 'CRYPTO_AUTHENTICATION_FAILED' || err instanceof AuthenticatedPayloadError ||
+            (authenticated && permanentSemanticErrors.has(err.code))) {
           this.quarantinedEnvelopeIds.add(envId);
         }
       }
@@ -381,39 +441,23 @@ export class LocalFirstSyncEngine {
     return this.store.getRawRowState(pk);
   }
 
+  /**
+   * Map an ambiguous legacy vault entry in this engine instance. This local
+   * correction is not sent to peers; each persisted copy requires mapping.
+   */
+  public mapLegacyVaultEntry(pk: string, field: string, legacyIndex: number, sourceVersion: number, schemaPosition: number | 'end'): void {
+    this.store.mapLegacyVaultEntry(pk, field, legacyIndex, sourceVersion, schemaPosition);
+  }
+
   public listRawRowStates(): readonly CrdtRowState[] {
     return this.store.listRawRowStates();
   }
 
   public exportSqlSnapshot(dialect: SqlDialect): {
     readonly ddl: string;
-    readonly upserts: readonly { readonly sql: string; readonly params: readonly ScalarValue[] }[];
+    readonly rows: readonly CrdtRowState[];
   } {
     const schema = this.getCurrentSchema();
-    const ddl = compileCreateTableSql(schema, dialect);
-    const upserts = this.listRawRowStates()
-      .filter((r) => !isRowTombstoned(r))
-      .map((raw) => {
-        const row = this.getRow(raw.pk)!;
-        const clocks = [
-          ...Object.values(raw.cells).map((cell) => cell.hlc),
-          ...Object.values(raw.unmappedFields).map((entry) => entry.hlc),
-          ...(raw.tombstoneHlc === null ? [] : [raw.tombstoneHlc]),
-        ];
-        const maxHlc = clocks.reduce(
-          (acc, hlc) => (acc === '' || compareHlc(hlc, acc) > 0 ? hlc : acc),
-          ''
-        );
-        return compileParameterizedUpsert(
-          schema,
-          row,
-          maxHlc,
-          JSON.stringify(raw.unmappedFields),
-          dialect,
-          JSON.stringify(Object.fromEntries(Object.entries(raw.cells).map(([name, cell]) => [name, cell.hlc])))
-        );
-      });
-
-    return { ddl, upserts };
+    return { ddl: compileCreateTableSql(schema, dialect), rows: this.listRawRowStates() };
   }
 }

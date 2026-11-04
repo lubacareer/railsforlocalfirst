@@ -7,4 +7,5 @@ export * from './crdt';
 export * from './crypto';
 export * from './storage';
 export * from './syncEngine';
+export * from './sqlStore';
 

@@ -22,6 +22,14 @@ const IV_BYTE_LENGTH = 12;
 const AES_TAG_BITS = 128;
 const MIN_PASSPHRASE_LENGTH = 12;
 
+/** A validation error produced only after successful AES-GCM authentication. */
+export class AuthenticatedPayloadError extends SafetyViolationError {
+  constructor(code: string, message: string) {
+    super(code, message);
+    Object.setPrototypeOf(this, AuthenticatedPayloadError.prototype);
+  }
+}
+
 function getWebCrypto(): Crypto {
   if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
     return globalThis.crypto;
@@ -68,15 +76,6 @@ export function base64ToBytes(b64: string): Uint8Array {
   }
 }
 
-export async function sha256Hex(data: Uint8Array): Promise<string> {
-  const webCrypto = getWebCrypto();
-  const digest = await webCrypto.subtle.digest('SHA-256', data as BufferSource);
-  const bytes = new Uint8Array(digest);
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
 function buildCanonicalAadBytes(params: {
   readonly protocolVersion: number;
   readonly envelopeId: string;
@@ -86,8 +85,9 @@ function buildCanonicalAadBytes(params: {
   readonly minHlc: string;
   readonly maxHlc: string;
   readonly operationCount: number;
+  readonly createdAtIso?: string;
 }): Uint8Array {
-  const canonical = JSON.stringify([
+  const fields: (number | string | undefined)[] = [
     params.protocolVersion,
     params.envelopeId,
     params.nodeId,
@@ -96,7 +96,9 @@ function buildCanonicalAadBytes(params: {
     params.minHlc,
     params.maxHlc,
     params.operationCount,
-  ]);
+  ];
+  if (params.protocolVersion === 3) fields.push(params.createdAtIso);
+  const canonical = JSON.stringify(fields);
   return new TextEncoder().encode(canonical);
 }
 
@@ -188,7 +190,7 @@ export async function encryptSyncOperations(params: {
   }
 
   const plaintextPayload: SyncPlaintextPayload = {
-    protocolVersion: 2,
+    protocolVersion: 3,
     envelopeId: params.envelopeId,
     nodeId: params.nodeId,
     table: params.table,
@@ -211,9 +213,10 @@ export async function encryptSyncOperations(params: {
   const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTE_LENGTH));
   const iterations = params.kdfIterations ?? DEFAULT_KDF_ITERATIONS;
 
+  const createdAtIso = new Date().toISOString();
   const key = await deriveAesGcmKey(params.passphrase, salt, iterations, ['encrypt']);
   const aad = buildCanonicalAadBytes({
-    protocolVersion: 2,
+    protocolVersion: 3,
     envelopeId: params.envelopeId,
     nodeId: params.nodeId,
     table: params.table,
@@ -221,6 +224,7 @@ export async function encryptSyncOperations(params: {
     minHlc,
     maxHlc,
     operationCount: params.operations.length,
+    createdAtIso,
   });
 
   const ciphertextBuffer = await webCrypto.subtle.encrypt(
@@ -236,7 +240,7 @@ export async function encryptSyncOperations(params: {
 
   return Object.freeze({
     envelopeId: params.envelopeId,
-    protocolVersion: 2,
+    protocolVersion: 3,
     nodeId: params.nodeId,
     table: params.table,
     schemaVersion: params.schemaVersion,
@@ -247,7 +251,7 @@ export async function encryptSyncOperations(params: {
     kdfIterations: iterations,
     ivBase64: bytesToBase64(iv),
     ciphertextBase64: bytesToBase64(new Uint8Array(ciphertextBuffer)),
-    createdAtIso: new Date().toISOString(),
+    createdAtIso,
   });
 }
 
@@ -255,7 +259,7 @@ export async function decryptSyncEnvelope(
   envelope: EncryptedSyncEnvelope,
   passphrase: string
 ): Promise<SyncPlaintextPayload> {
-  if (!envelope || envelope.protocolVersion !== 2) {
+  if (!envelope || (envelope.protocolVersion !== 2 && envelope.protocolVersion !== 3)) {
     throw new SafetyViolationError(
       'UNSUPPORTED_PROTOCOL_VERSION',
       `Unsupported envelope protocolVersion: ${String(envelope?.protocolVersion)}.`
@@ -267,6 +271,9 @@ export async function decryptSyncEnvelope(
   assertValidSqlIdentifier(envelope.table, 'table');
   parseHlc(envelope.minHlc);
   parseHlc(envelope.maxHlc);
+  if (envelope.protocolVersion === 3 && typeof envelope.createdAtIso !== 'string') {
+    throw new SafetyViolationError('INVALID_ENVELOPE_TIMESTAMP', 'Envelope timestamp must be a string.');
+  }
 
   if (
     !Number.isSafeInteger(envelope.operationCount) ||
@@ -303,6 +310,7 @@ export async function decryptSyncEnvelope(
     minHlc: envelope.minHlc,
     maxHlc: envelope.maxHlc,
     operationCount: envelope.operationCount,
+    createdAtIso: envelope.createdAtIso,
   });
 
   const webCrypto = getWebCrypto();
@@ -325,13 +333,28 @@ export async function decryptSyncEnvelope(
     );
   }
 
+  if (envelope.protocolVersion === 3) {
+    const parsedTime = Date.parse(envelope.createdAtIso);
+    if (!Number.isFinite(parsedTime) || new Date(parsedTime).toISOString() !== envelope.createdAtIso) {
+      throw new AuthenticatedPayloadError('INVALID_ENVELOPE_TIMESTAMP', 'Authenticated envelope timestamp must be canonical ISO 8601.');
+    }
+  }
+
   const plaintextBytes = new Uint8Array(decryptedBuffer);
   const decodedText = new TextDecoder().decode(plaintextBytes);
-  const payload = safeJsonParse<SyncPlaintextPayload>(decodedText);
+  let payload: SyncPlaintextPayload;
+  try {
+    payload = safeJsonParse<SyncPlaintextPayload>(decodedText);
+  } catch (error) {
+    if (error instanceof SafetyViolationError) {
+      throw new AuthenticatedPayloadError(error.code, error.message);
+    }
+    throw error;
+  }
 
   if (
     !payload || typeof payload !== 'object' ||
-    payload.protocolVersion !== 2 ||
+    payload.protocolVersion !== envelope.protocolVersion ||
     payload.envelopeId !== envelope.envelopeId ||
     payload.nodeId !== envelope.nodeId ||
     payload.table !== envelope.table ||
@@ -341,7 +364,7 @@ export async function decryptSyncEnvelope(
     !Array.isArray(payload.operations) ||
     payload.operations.length !== envelope.operationCount
   ) {
-    throw new SafetyViolationError(
+    throw new AuthenticatedPayloadError(
       'ENVELOPE_HEADER_MISMATCH',
       'Inner authenticated payload headers do not match outer envelope metadata.'
     );

@@ -23,9 +23,9 @@ const envelope = (id: string, operations: CrdtChangeOperation[]) => encryptSyncO
 });
 
 describe('sync review regressions', () => {
-  it('writes v2 envelopes without plaintext hashes and rejects v1', async () => {
+  it('writes v3 envelopes without plaintext hashes and rejects v1', async () => {
     const env = await envelope('env-test', [op('one', time(1000), 'secret')]);
-    expect(env.protocolVersion).toBe(2);
+    expect(env.protocolVersion).toBe(3);
     expect(env).not.toHaveProperty('payloadSha256');
     expect((await decryptSyncEnvelope(env, passphrase)).operations).toHaveLength(1);
     await expect(decryptSyncEnvelope({ ...env, protocolVersion: 1 } as unknown as EncryptedSyncEnvelope, passphrase))
@@ -79,7 +79,7 @@ describe('sync review regressions', () => {
     const key = await subtle.deriveKey({ name: 'PBKDF2', salt: base64ToBytes(env.kdfSaltBase64) as BufferSource,
       iterations: env.kdfIterations, hash: 'SHA-256' }, material, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
     const aad = new TextEncoder().encode(JSON.stringify([env.protocolVersion, env.envelopeId, env.nodeId,
-      env.table, env.schemaVersion, env.minHlc, env.maxHlc, env.operationCount]));
+      env.table, env.schemaVersion, env.minHlc, env.maxHlc, env.operationCount, env.createdAtIso]));
     const encrypted = await subtle.encrypt({ name: 'AES-GCM', iv: base64ToBytes(env.ivBase64) as BufferSource,
       additionalData: aad, tagLength: 128 }, key, new TextEncoder().encode(JSON.stringify(forged)));
     const store = new InMemoryByoStorageAdapter();
@@ -290,6 +290,6 @@ describe('sync review regressions', () => {
     await store.putEnvelope(await envelope('env-future', [future]));
     expect((await engine.pullFromStorage(store, passphrase, 2000)).rejectedEnvelopes).toHaveLength(0);
     expect(engine.getRawRowState('one')?.unmappedFields.future?.hlc).toBe(time(2000));
-    expect(engine.exportSqlSnapshot('sqlite').upserts[0]?.params[2]).toBe(time(2000));
+    expect(engine.exportSqlSnapshot('sqlite').rows[0]?.unmappedFields.future?.hlc).toBe(time(2000));
   });
 });

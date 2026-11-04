@@ -422,7 +422,7 @@ export function App(): React.ReactElement {
         <section className="card">
           <div className="card-header">
             <h2 className="card-title">
-              Deterministic Schema &amp; Parameterized SQL ({dialect.toUpperCase()})
+              Schema &amp; CRDT Snapshot ({dialect.toUpperCase()})
             </h2>
             <span className="status-badge">Injection-Safe Identifiers</span>
           </div>
@@ -433,12 +433,13 @@ export function App(): React.ReactElement {
               ...migrationPlan.map((step) =>
                 step.kind === 'sql'
                   ? step.statement
-                  : `-- REQUIRED APPLICATION STEP: ${step.operation.fnName} on ${step.operation.table}.${step.operation.column}${step.operation.targetType ? `; change type to ${step.operation.targetType}` : ''} (v${step.fromVersion} → v${step.toVersion})`
+                  : step.kind === 'application_migration'
+                    ? `-- REQUIRED APPLICATION MIGRATION: ${step.sourceSchema.tableName} v${step.step.fromVersion} → v${step.step.toVersion}`
+                    : `-- REQUIRED APPLICATION STEP: ${step.operation.fnName} on ${step.operation.table}.${step.operation.column}${step.operation.targetType ? `; change type to ${step.operation.targetType}` : ''} (v${step.fromVersion} → v${step.toVersion})`
               ),
               '',
-              ...sqlSnapshot.upserts.map(
-                (q) => `${q.sql}\n-- Bound Params: ${JSON.stringify(q.params)}`
-              ),
+              '-- CRDT row states for transactional merge (including tombstones):',
+              JSON.stringify(sqlSnapshot.rows, null, 2),
             ].join('\n')}
           </pre>
         </section>

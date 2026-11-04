@@ -5,8 +5,10 @@ import {
   assertValidPrimaryKey,
   assertValidSqlIdentifier,
   createSafeRecord,
+  SafetyViolationError,
 } from './safety';
 import { defaultZeroForType } from './schema';
+import { canonicalHlc, cellWins, flattenVaultEntry, mergeVaultEntries, validateVaultEntry } from './vault';
 import type {
   ConflictResolutionEvent,
   CrdtCell,
@@ -26,21 +28,6 @@ import type {
  * strictly newer HLC than `tombstoneHlc`. This guarantees strict commutativity,
  * associativity, and idempotence across out-of-order delete and upsert operations.
  */
-function compareScalarDeterministically(a: ScalarValue, b: ScalarValue): number {
-  const rankType = (v: ScalarValue): number => {
-    if (v === null) return 0;
-    if (typeof v === 'boolean') return 1;
-    if (typeof v === 'number') return 2;
-    return 3;
-  };
-  const typeDiff = rankType(a) - rankType(b);
-  if (typeDiff !== 0) return typeDiff;
-  const strA = String(a);
-  const strB = String(b);
-  if (strA === strB) return 0;
-  return strA < strB ? -1 : 1;
-}
-
 export function isRowTombstoned(state: CrdtRowState): boolean {
   if (state.tombstoneHlc === null) {
     return false;
@@ -51,11 +38,50 @@ export function isRowTombstoned(state: CrdtRowState): boolean {
     }
   }
   for (const vault of Object.values(state.unmappedFields)) {
-    if (compareHlc(vault.hlc, state.tombstoneHlc) > 0) {
-      return false;
-    }
+    for (const entry of flattenVaultEntry(vault))
+      if (compareHlc(entry.hlc, state.tombstoneHlc) > 0) return false;
   }
   return true;
+}
+
+/** Join two same-schema states using exactly the same register rules as operations. */
+export function mergeCrdtRowStates(left: CrdtRowState, right: CrdtRowState): CrdtRowState {
+  if (left.table !== right.table || left.pk !== right.pk || left.schemaVersion !== right.schemaVersion) {
+    throw new SafetyViolationError('ROW_STATE_MISMATCH', 'Cannot merge rows with different tables, keys, or schema versions.');
+  }
+  for (const row of [left, right]) {
+    assertValidSqlIdentifier(row.table, 'table');
+    assertValidPrimaryKey(row.pk);
+    if (!Number.isSafeInteger(row.schemaVersion) || row.schemaVersion < 1) {
+      throw new SafetyViolationError('INVALID_SCHEMA_VERSION', 'Row schema version must be a positive integer.');
+    }
+    if (row.tombstoneHlc !== null) parseHlc(row.tombstoneHlc);
+    for (const [column, cell] of Object.entries(row.cells)) {
+      assertValidSqlIdentifier(column, 'column');
+      assertSafeScalarValue(cell.value, column);
+      if (Object.prototype.hasOwnProperty.call(cell, 'tieValue')) assertSafeScalarValue(cell.tieValue, `${column} tie value`);
+      parseHlc(cell.hlc);
+    }
+    for (const [field, entry] of Object.entries(row.unmappedFields)) validateVaultEntry(entry, field);
+  }
+  const result = cloneRowState(left);
+  const canonicalRight = cloneRowState(right);
+  for (const [column, cell] of Object.entries(canonicalRight.cells)) {
+    assertValidSqlIdentifier(column, 'column');
+    assertSafeScalarValue(cell.value, column);
+    parseHlc(cell.hlc);
+    const existing = result.cells[column];
+    if (!existing || cellWins(cell, existing)) result.cells[column] = { ...cell };
+  }
+  for (const [field, entry] of Object.entries(canonicalRight.unmappedFields)) {
+    validateVaultEntry(entry, field);
+    result.unmappedFields[field] = mergeVaultEntries(result.unmappedFields[field], entry);
+  }
+  const tombstone = result.tombstoneHlc === null ? canonicalRight.tombstoneHlc :
+    canonicalRight.tombstoneHlc === null || compareHlc(result.tombstoneHlc, canonicalRight.tombstoneHlc) >= 0
+      ? result.tombstoneHlc : canonicalRight.tombstoneHlc;
+  if (tombstone !== null) parseHlc(tombstone);
+  return { ...result, tombstoneHlc: tombstone };
 }
 
 export class CrdtTableStore {
@@ -124,10 +150,20 @@ export class CrdtTableStore {
     assertValidPrimaryKey(rawOp.pk);
     parseHlc(rawOp.hlc);
 
-    const { operation: op, wasUpcasted, preservedFutureFieldCount } =
+    const { operation, wasUpcasted, preservedFutureFieldCount } =
       this.registry.normalizeChangeOperation(rawOp, this.currentVersion);
+    const op = {
+      ...operation,
+      hlc: canonicalHlc(operation.hlc),
+      columns: createSafeRecord(Object.entries(operation.columns).map(([name, cell]) => [name, { ...cell, hlc: canonicalHlc(cell.hlc) }])),
+      ...(operation.unmappedFields && { unmappedFields: createSafeRecord(Object.entries(operation.unmappedFields).map(([name, entry]) => [name, mergeVaultEntries(undefined, entry)])) }),
+    };
 
     const schema = this.getCurrentSchema();
+    const primaryCell = op.columns[schema.primaryKey];
+    if (primaryCell && primaryCell.value !== op.pk) {
+      throw new SafetyViolationError('PRIMARY_KEY_MISMATCH', 'Operation primary-key cell does not match its row key.');
+    }
     const existing = this.rows.get(op.pk);
     const conflicts: ConflictResolutionEvent[] = [];
 
@@ -155,22 +191,21 @@ export class CrdtTableStore {
     for (const [colName, incomingCell] of Object.entries(op.columns)) {
       assertValidSqlIdentifier(colName, 'column');
       parseHlc(incomingCell.hlc);
+      if (Object.prototype.hasOwnProperty.call(incomingCell, 'tieValue')) assertSafeScalarValue(incomingCell.tieValue, `${colName} tie value`);
 
       const colSpec = schema.columns.find((c) => c.name === colName);
       if (!colSpec) {
         const safeVal = assertSafeScalarValue(incomingCell.value, colName);
         const existingVault = baseRow.unmappedFields[colName];
-        const vaultCmp = existingVault ? compareHlc(incomingCell.hlc, existingVault.hlc) : 1;
-        if (
-          !existingVault ||
-          vaultCmp > 0 ||
-          (vaultCmp === 0 && compareScalarDeterministically(safeVal, existingVault.value) > 0)
-        ) {
-          baseRow.unmappedFields[colName] = {
+        const merged = mergeVaultEntries(existingVault, {
             value: safeVal,
             hlc: incomingCell.hlc,
             sourceVersion: op.schemaVersion,
-          };
+            schemaPosition: 'end',
+            ...(Object.prototype.hasOwnProperty.call(incomingCell, 'tieValue') && { tieValue: incomingCell.tieValue }),
+          });
+        if (JSON.stringify(existingVault) !== JSON.stringify(merged)) {
+          baseRow.unmappedFields[colName] = merged;
           anyCellUpdated = true;
         }
         continue;
@@ -186,16 +221,15 @@ export class CrdtTableStore {
       const currentCell = baseRow.cells[colName];
       if (!currentCell) {
         baseRow.cells[colName] = {
+          ...incomingCell,
           value: validatedValue,
-          hlc: incomingCell.hlc,
         };
         anyCellUpdated = true;
         continue;
       }
 
       const cmp = compareHlc(incomingCell.hlc, currentCell.hlc);
-      const winsOnTie =
-        cmp === 0 && compareScalarDeterministically(validatedValue, currentCell.value) > 0;
+      const winsOnTie = cmp === 0 && cellWins(incomingCell, currentCell);
       if (cmp > 0 || winsOnTie) {
         if (
           existing &&
@@ -217,8 +251,8 @@ export class CrdtTableStore {
           this.conflictLog.push(event);
         }
         baseRow.cells[colName] = {
+          ...incomingCell,
           value: validatedValue,
-          hlc: incomingCell.hlc,
         };
         anyCellUpdated = true;
       } else if (cmp < 0 && existing && currentCell.value !== validatedValue) {
@@ -240,20 +274,11 @@ export class CrdtTableStore {
     if (op.unmappedFields) {
       for (const [fieldKey, vaultEntry] of Object.entries(op.unmappedFields)) {
         assertValidSqlIdentifier(fieldKey, 'unmapped field');
-        parseHlc(vaultEntry.hlc);
-        const safeVal = assertSafeScalarValue(vaultEntry.value, fieldKey);
+        validateVaultEntry(vaultEntry, fieldKey);
         const currentVault = baseRow.unmappedFields[fieldKey];
-        const vaultCmp = currentVault ? compareHlc(vaultEntry.hlc, currentVault.hlc) : 1;
-        if (
-          !currentVault ||
-          vaultCmp > 0 ||
-          (vaultCmp === 0 && compareScalarDeterministically(safeVal, currentVault.value) > 0)
-        ) {
-          baseRow.unmappedFields[fieldKey] = {
-            value: safeVal,
-            hlc: vaultEntry.hlc,
-            sourceVersion: vaultEntry.sourceVersion,
-          };
+        const merged = mergeVaultEntries(currentVault, vaultEntry);
+        if (JSON.stringify(currentVault) !== JSON.stringify(merged)) {
+          baseRow.unmappedFields[fieldKey] = merged;
           anyCellUpdated = true;
         }
       }
@@ -359,6 +384,15 @@ export class CrdtTableStore {
     assertValidPrimaryKey(pk);
     const state = this.rows.get(pk);
     return state ? cloneRowState(state) : null;
+  }
+
+  /** Resolve one ambiguous legacy vault value using an explicitly supplied schema position. */
+  public mapLegacyVaultEntry(pk: string, field: string, legacyIndex: number, sourceVersion: number, schemaPosition: number | 'end'): void {
+    assertValidPrimaryKey(pk);
+    const row = this.rows.get(pk);
+    if (!row) throw new SafetyViolationError('ROW_NOT_FOUND', `Row "${pk}" does not exist.`);
+    const mapped = this.registry.mapLegacyVaultEntry(row, field, legacyIndex, sourceVersion, schemaPosition);
+    this.rows.set(pk, mapped);
   }
 
   public listRawRowStates(): readonly CrdtRowState[] {

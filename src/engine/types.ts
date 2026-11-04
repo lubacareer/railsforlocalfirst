@@ -23,6 +23,8 @@ export interface AddColumnOperation {
   readonly table: string;
   readonly column: ColumnSpec;
   readonly backfillFromColumn?: string;
+  /** Reintroduce a previously archived field lineage, rather than creating a new field. */
+  readonly restoreFrom?: { readonly column: string; readonly version: number };
 }
 
 export interface RenameColumnOperation {
@@ -70,12 +72,21 @@ export interface ParsedHLC {
 export interface CrdtCell {
   readonly value: ScalarValue;
   readonly hlc: string;
+  /** Original scalar used to break equal-HLC ties after representation transforms. */
+  readonly tieValue?: ScalarValue;
 }
 
 export interface UnmappedVaultEntry {
   readonly value: ScalarValue;
   readonly hlc: string;
+  readonly tieValue?: ScalarValue;
   readonly sourceVersion: number;
+  /** Stable field identity, when the source schema history is available. */
+  readonly lineageId?: string;
+  /** 'end' is the completed version; a number is operations completed within that version. */
+  readonly schemaPosition?: number | 'end';
+  /** Independent versions or incarnations of the same field name. Entries are flat. */
+  readonly alternatives?: readonly UnmappedVaultEntry[];
 }
 
 export interface CrdtRowState {
@@ -100,7 +111,7 @@ export interface CrdtChangeOperation {
 }
 
 export interface SyncPlaintextPayload {
-  readonly protocolVersion: 2;
+  readonly protocolVersion: 2 | 3;
   readonly envelopeId: string;
   readonly nodeId: string;
   readonly table: string;
@@ -112,7 +123,7 @@ export interface SyncPlaintextPayload {
 
 export interface EncryptedSyncEnvelope {
   readonly envelopeId: string;
-  readonly protocolVersion: 2;
+  readonly protocolVersion: 2 | 3;
   readonly nodeId: string;
   readonly table: string;
   readonly schemaVersion: number;
@@ -140,6 +151,13 @@ export interface ConflictResolutionEvent {
 /** Execute in order within one transaction. SQL alone does not execute application steps. */
 export type SqlMigrationPlanStep =
   | { readonly kind: 'sql'; readonly statement: string }
+  | {
+      readonly kind: 'application_migration';
+      readonly step: MigrationStep;
+      readonly sourceSchema: TableSchema;
+      readonly targetSchema: TableSchema;
+      readonly dialect: SqlDialect;
+    }
   | {
       readonly kind: 'application_transform';
       readonly operation: TransformColumnOperation;
