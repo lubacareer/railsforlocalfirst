@@ -20,7 +20,7 @@ jobs:
       - run:
           name: Wait for PostgreSQL
           command: |
-            node <<'NODE'
+            node \<<'NODE'
             const { Client } = require('pg');
             (async () => {
               for (let attempt = 0; attempt < 60; attempt++) {
