@@ -11,23 +11,6 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81 # PostgreSQL 18; update digest deliberately
-        env:
-          POSTGRES_USER: rails_test
-          POSTGRES_PASSWORD: rails_test
-          POSTGRES_DB: rails_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U rails_test -d rails_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      TEST_POSTGRES_URL: postgresql://rails_test:rails_test@127.0.0.1:5432/rails_test
-      REQUIRE_POSTGRES_TESTS: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -43,12 +26,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Run test suite
+      - name: Run core and SQLite test suite
         run: npm test
 
-      - name: Build production bundle
+      - name: Typecheck and build production bundle
         run: npm run build
 

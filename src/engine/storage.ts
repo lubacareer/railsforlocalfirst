@@ -66,6 +66,12 @@ function isRestrictedHost(rawHostname: string): boolean {
   return ipv4 !== null && isRestrictedIpv4(ipv4);
 }
 
+/**
+ * Validates configuration syntax and S3 endpoint literals only; success does not
+ * authorize network requests or establish SSRF protection. A network adapter must
+ * validate every DNS-resolved address at connection time and after redirects,
+ * then connect to the validated address to prevent DNS rebinding.
+ */
 export function validateByoStorageConfig(config: ByoStorageConfig): ByoStorageConfig {
   assertValidStorageKey(config.bucketOrFolderName);
 

@@ -14,6 +14,7 @@ import {
 } from './safety';
 import { compileCreateTableSql } from './schema';
 import type {
+  ColumnSpec,
   ConflictResolutionEvent,
   CrdtCell,
   CrdtChangeOperation,
@@ -34,6 +35,18 @@ export interface LocalFirstSyncEngineOptions {
   readonly initialActiveVersion?: number;
   readonly initialWallTimeMs?: number;
   readonly maxDriftMs?: number;
+}
+
+/** Only raw authenticated values are permanent; local migration results may be repaired. */
+function assertAuthenticatedScalarValue(value: unknown, field: string, column?: ColumnSpec): void {
+  try {
+    assertSafeScalarValue(value, field, column?.type, column?.nullable ?? true);
+  } catch (error) {
+    if (error instanceof SafetyViolationError) {
+      throw new AuthenticatedPayloadError(error.code, error.message);
+    }
+    throw error;
+  }
 }
 
 export class LocalFirstSyncEngine {
@@ -382,20 +395,32 @@ export class LocalFirstSyncEngine {
           }
           actualMin = actualMin === undefined || compareHlc(op.hlc, actualMin) < 0 ? op.hlc : actualMin;
           actualMax = actualMax === undefined || compareHlc(op.hlc, actualMax) > 0 ? op.hlc : actualMax;
-          for (const cell of Object.values(op.columns)) {
+          // Validate against the sender's known schema, never the receiver's current
+          // types: future representations may need to remain opaque in the vault.
+          const sourceSchema = op.schemaVersion <= this.registry.getLatestVersion()
+            ? this.registry.getSchemaAtVersion(op.schemaVersion) : undefined;
+          for (const [field, cell] of Object.entries(op.columns)) {
             if (!cell || typeof cell !== 'object') {
               throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Malformed sync cell or vault entry.');
+            }
+            assertAuthenticatedScalarValue(cell.value, field, sourceSchema?.columns.find(column => column.name === field));
+            if (Object.hasOwn(cell, 'tieValue')) {
+              assertAuthenticatedScalarValue(cell.tieValue, `${field} tie value`);
             }
             this.clock.validateRemoteHlc(cell.hlc, physicalTimeMs);
             if (compareHlc(cell.hlc, op.hlc) > 0) {
               throw new SafetyViolationError('HLC_EXCEEDS_OPERATION', 'Cell or vault HLC exceeds its operation HLC.');
             }
           }
-          const validateVault = (raw: unknown, isAlternative = false): void => {
+          const validateVault = (raw: unknown, field: string, isAlternative = false): void => {
             if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
               throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Malformed vault entry.');
             }
             const entry = raw as Record<string, unknown>;
+            assertAuthenticatedScalarValue(entry.value, field);
+            if (Object.hasOwn(entry, 'tieValue')) {
+              assertAuthenticatedScalarValue(entry.tieValue, `${field} tie value`);
+            }
             if (!Number.isSafeInteger(entry.sourceVersion) || (entry.sourceVersion as number) < 1 ||
                 (entry.lineageId !== undefined && typeof entry.lineageId !== 'string') ||
                 (entry.schemaPosition !== undefined && entry.schemaPosition !== 'end' &&
@@ -410,10 +435,10 @@ export class LocalFirstSyncEngine {
               if (isAlternative || !Array.isArray(entry.alternatives)) {
                 throw new SafetyViolationError('INVALID_SYNC_OPERATION', 'Vault alternatives must be a flat array.');
               }
-              for (const alternative of entry.alternatives) validateVault(alternative, true);
+              for (const alternative of entry.alternatives) validateVault(alternative, field, true);
             }
           };
-          for (const entry of Object.values(op.unmappedFields ?? {})) validateVault(entry);
+          for (const [field, entry] of Object.entries(op.unmappedFields ?? {})) validateVault(entry, field);
           const result = this.store.applyOperation(op);
           if (result.applied) envelopeApplied++;
           if (result.wasUpcasted) envelopeUpcasted++;

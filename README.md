@@ -29,7 +29,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
    - Authenticates `protocolVersion`, `envelopeId`, `nodeId`, `table`, `schemaVersion`, `minHlc`, `maxHlc`, `operationCount`, and, in v3, `createdAtIso` as AES-GCM **Additional Authenticated Data (AAD)**. These fields and other envelope metadata remain visible to storage providers.
    - New envelopes use protocol v3. Existing v2 envelopes can be read, but their `createdAtIso` is unauthenticated and must not be trusted. Protocol v1 is unsupported; older clients cannot read v3 envelopes.
    - AAD does not prevent replay or rollback. Processed envelope IDs are suppressed only for the lifetime of one engine instance; the in-memory adapter refuses replacement of an existing ID but does not reject older valid envelopes. Older schema operations are upcast before application.
-   - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope. A user-provided migration transform that throws produces a retryable `MIGRATION_TRANSFORM_FAILED` rejection; local migrations throw `MigrationTransformError` with the original error as its cause.
+   - Pull and sync reports include rejected envelope IDs and error codes. Authentication failures and malformed authenticated scalar values are quarantined in memory; call `retryRejectedEnvelopes(id)` or `retryRejectedEnvelopes()` after correcting the passphrase or restoring an envelope. Raw cell values are checked against their source schema when known; unknown future fields and vault alternatives receive scalar-safety checks without current-schema type constraints. Invalid outputs from local migration functions remain retryable. A user-provided migration transform that throws produces a retryable `MIGRATION_TRANSFORM_FAILED` rejection; local migrations throw `MigrationTransformError` with the original error as its cause.
    - Each push sends one bounded batch; call it again while the outbox is non-empty. Per-envelope storage read failures remain retryable. Ordinary errors are reported as `STORAGE_READ_FAILED`; `SafetyViolationError` failures retain their specific codes.
 
 4. **SQLite & PostgreSQL CRDT Persistence (`src/engine/sqlStore.ts`)**
@@ -43,7 +43,7 @@ Building local-first software (using SQLite/IndexedDB on the client + CRDTs) hit
 
 - **Zero SQL Injection**: Identifiers are strictly allowlisted (`/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/`) and checked against reserved SQL keywords; runtime values are bound parameters.
 - **Prototype Pollution Defense**: `safeJsonParse` and `assertNoPrototypePollution` reject `__proto__`, `constructor`, and `prototype` keys at every boundary.
-- **SSRF & Path Traversal Protection**: For S3-compatible storage, configuration validates the endpoint and blocks non-HTTPS URLs, embedded credentials, restricted literal IPs, and metadata hostnames. Storage keys are separately checked for `..` traversal. Endpoint hostname validation does not resolve DNS. A network adapter must validate every resolved address at connection time, including after redirects, and connect to the validated address to prevent DNS rebinding.
+- **Endpoint Configuration & Storage Key Validation**: For S3-compatible storage, configuration checks block non-HTTPS URLs, embedded credentials, restricted literal IPs, and metadata hostnames. Storage keys are separately checked for `..` traversal. Passing configuration validation does not authorize network requests or establish SSRF protection: it does not resolve DNS. The current storage adapter is in-memory and makes no network requests. A future network adapter must validate every resolved address at connection time, including after redirects, and connect to the validated address to prevent DNS rebinding.
 - **Content Security Policy (CSP)**: Production HTML contains a restrictive CSP meta tag; development HTML omits it for Vite. Configure the hosting layer to send `Content-Security-Policy: frame-ancestors 'none'` (or `X-Frame-Options: DENY`) as an HTTP response header: browsers ignore `frame-ancestors` in a meta tag.
 
 ---
@@ -61,6 +61,8 @@ npm run dev
 ```
 
 Open the local address printed by Vite. To run the PostgreSQL integration tests, point `TEST_POSTGRES_URL` at a disposable PostgreSQL database; CI provisions one automatically. The tests create and drop test tables.
+
+CI responsibilities are split between providers: GitHub Actions runs the core and SQLite tests, then typechecks and builds the production bundle; CircleCI provisions PostgreSQL and runs its persistence and migration rollback integration tests. PostgreSQL cases are intentionally skipped in GitHub Actions. Benchmark reporting runs in a separate GitHub Actions workflow.
 
 ## Performance benchmarks
 

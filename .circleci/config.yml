@@ -26,6 +26,7 @@ jobs:
           command: npm ci
       - run:
           name: Wait for PostgreSQL
+          # CircleCI removes this heredoc escape before passing the command to the shell.
           command: |
             node \<<'NODE'
             const { Client } = require('pg');
@@ -46,14 +47,8 @@ jobs:
             })().catch(error => { console.error(error); process.exit(1); });
             NODE
       - run:
-          name: Typecheck
-          command: npm run typecheck
-      - run:
-          name: Run test suite
-          command: npm test
-      - run:
-          name: Build production bundle
-          command: npm run build
+          name: Run PostgreSQL integration tests
+          command: npx vitest run tests/sql-store.test.ts tests/sql-rollback-review.test.ts -t postgres
 
 workflows:
   checks:

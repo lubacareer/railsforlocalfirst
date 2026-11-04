@@ -123,6 +123,8 @@ function parseSqlNumeric(value: string, type: 'INTEGER' | 'REAL', column: string
   if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) throw invalid();
   const number = Number(value);
   if (!Number.isFinite(number)) throw invalid();
+  // Exponent digits do not make an all-zero significand nonzero.
+  if (number === 0 && /[1-9]/.test(value.split(/[eE]/, 1)[0]!)) throw invalid();
   return number;
 }
 

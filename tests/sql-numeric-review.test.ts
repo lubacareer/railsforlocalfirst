@@ -43,7 +43,17 @@ describe('SQL numeric driver strings', () => {
       .rejects.toMatchObject({ code: 'INVALID_SQL_NUMERIC_VALUE' });
   });
 
-  it.each(['0', '-0', '+17.5', '-.25', '1.', '2e3', '-1.25E-2'])('reads finite decimal REAL %j', async value => {
+  it.each(['1e-324', '-1e-324', '2e-324', '-2e-324', '0.0001e-999', '-0.0001e-999'])('rejects underflowing nonzero REAL %j', async value => {
+    await expect(listLiveSqlRows(rawDriver(value), schemaFor('REAL')))
+      .rejects.toMatchObject({ code: 'INVALID_SQL_NUMERIC_VALUE' });
+  });
+
+  it.each(['0', '-0', '+0', '.0', '0.', '0e-324', '-0e-324', '+0.000E999', '-0.000e999'])('preserves true REAL zero %j', async value => {
+    const [row] = await listLiveSqlRows(rawDriver(value), schemaFor('REAL'));
+    expect(row?.cells.value?.value).toBe(Number(value));
+  });
+
+  it.each(['+17.5', '-.25', '1.', '2e3', '-1.25E-2', '5e-324', '-5e-324'])('reads finite nonzero decimal REAL %j', async value => {
     const [row] = await listLiveSqlRows(rawDriver(value), schemaFor('REAL'));
     expect(row?.cells.value?.value).toBe(Number(value));
   });
