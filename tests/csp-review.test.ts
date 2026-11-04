@@ -14,5 +14,9 @@ describe('production CSP', () => {
     expect(result[0]?.injectTo).toBe('head-prepend');
     expect(result[0]?.attrs.content).toContain("default-src 'self'");
     expect(result[0]?.attrs.content).not.toContain('frame-ancestors');
+    const directives = new Map(result[0]!.attrs.content!.split(';').map(part => part.trim().split(/\s+/)).filter(parts => parts[0]).map(([name, ...values]) => [name!, values]));
+    expect(directives.get('script-src')).toEqual(["'self'"]);
+    expect(directives.get('script-src')).not.toContain("'unsafe-inline'");
+    expect(directives.get('object-src')).toEqual(["'none'"]);
   });
 });

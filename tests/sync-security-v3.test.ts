@@ -55,6 +55,14 @@ describe('v3 envelope and endpoint validation', () => {
     expect((await decryptSyncEnvelope({ ...v2, createdAtIso: 'untrusted' }, password)).protocolVersion).toBe(2);
   });
 
+  it('quarantines an authenticated non-canonical v3 timestamp', async () => {
+    const env = await rewrap(await makeEnvelope(), { createdAtIso: '2026-01-01T00:00:00Z' });
+    await expect(decryptSyncEnvelope(env, password)).rejects.toMatchObject({ code: 'INVALID_ENVELOPE_TIMESTAMP' });
+    const { engine, storage, result } = await pull(env);
+    expect(result.rejectedEnvelopes).toEqual([{ envelopeId: env.envelopeId, errorCode: 'INVALID_ENVELOPE_TIMESTAMP' }]);
+    expect((await engine.pullFromStorage(storage, password, 1000)).rejectedEnvelopes).toEqual([]);
+  });
+
   it('quarantines invalid JSON only after authentication succeeds', async () => {
     const env = await rewrap(await makeEnvelope(), {}, '{invalid json');
     const { engine, storage, result } = await pull(env);
@@ -118,7 +126,7 @@ describe('v3 envelope and endpoint validation', () => {
 
   it.each([
     'https://[::127.0.0.1]', 'https://[64:ff9b::8.8.8.8]', 'https://[2002::1]',
-    'https://[2001:0::1]', 'https://192.0.0.1', 'https://198.18.0.1',
+    'https://[2001:0::1]', 'https://[ff00::]', 'https://[ff02::1]', 'https://[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]', 'https://192.0.0.1', 'https://198.18.0.1',
     'https://198.19.255.255', 'https://224.0.0.1', 'https://240.0.0.1',
   ])('blocks special-use or transition literal %s', endpointUrl => {
     expect(() => validateByoStorageConfig({ provider: 's3-compatible', bucketOrFolderName: 'bucket', endpointUrl }))

@@ -1,0 +1,54 @@
+version: 2.1
+
+jobs:
+  verify:
+    docker:
+      - image: cimg/node:22.16.0
+      - image: postgres:18@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81 # PostgreSQL 18
+        environment:
+          POSTGRES_USER: rails_test
+          POSTGRES_PASSWORD: rails_test
+          POSTGRES_DB: rails_test
+    environment:
+      TEST_POSTGRES_URL: postgresql://rails_test:rails_test@127.0.0.1:5432/rails_test
+      REQUIRE_POSTGRES_TESTS: '1'
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: npm ci
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            node <<'NODE'
+            const { Client } = require('pg');
+            (async () => {
+              for (let attempt = 0; attempt < 60; attempt++) {
+                const client = new Client({ connectionString: process.env.TEST_POSTGRES_URL });
+                try {
+                  await client.connect();
+                  await client.query('SELECT 1');
+                  await client.end();
+                  return;
+                } catch (error) {
+                  await client.end().catch(() => {});
+                  if (attempt === 59) throw error;
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+              }
+            })().catch(error => { console.error(error); process.exit(1); });
+            NODE
+      - run:
+          name: Typecheck
+          command: npm run typecheck
+      - run:
+          name: Run test suite
+          command: npm test
+      - run:
+          name: Build production bundle
+          command: npm run build
+
+workflows:
+  checks:
+    jobs:
+      - verify

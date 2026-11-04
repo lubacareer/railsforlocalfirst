@@ -26,6 +26,10 @@ import type {
 
 type LineageState = Record<string, { readonly id: string; readonly revision: number }>;
 
+function copyLineage(state: LineageState): LineageState {
+  return createSafeRecord(Object.entries(state).map(([name, lineage]) => [name, { ...lineage }]));
+}
+
 /**
  * Epoch-zero HLC used for schema-migration default values so that any real user
  * mutation from any peer (regardless of when the migration ran locally) always
@@ -41,6 +45,7 @@ export class SchemaMigrationRegistry {
   private readonly initialSchema: TableSchema;
   private readonly stepsByFromVersion = new Map<number, MigrationStep>();
   private readonly schemasByVersion = new Map<number, TableSchema>();
+  private readonly lineageCache = new Map<string, LineageState>();
   private maxVersion: number;
 
   constructor(initialSchema: TableSchema, steps: readonly MigrationStep[] = []) {
@@ -80,6 +85,7 @@ export class SchemaMigrationRegistry {
     const currentSchema = this.schemasByVersion.get(step.fromVersion)!;
     const nextSchema = evolveTableSchema(currentSchema, step.toVersion, step.operations);
 
+    this.lineageCache.clear();
     this.stepsByFromVersion.set(step.fromVersion, step);
     this.schemasByVersion.set(step.toVersion, nextSchema);
     this.maxVersion = step.toVersion;
@@ -93,10 +99,12 @@ export class SchemaMigrationRegistry {
         }
       }
       this.lineageState(step.toVersion);
+      this.lineageCache.clear();
     } catch (error) {
       this.stepsByFromVersion.delete(step.fromVersion);
       this.schemasByVersion.delete(step.toVersion);
       this.maxVersion = step.fromVersion;
+      this.lineageCache.clear();
       throw error;
     }
   }
@@ -167,6 +175,9 @@ export class SchemaMigrationRegistry {
   /** Reconstruct stable field identities and representation revisions at a schema position. */
   private lineageState(version: number, position: number | 'end' = 'end'): LineageState {
     this.getSchemaAtVersion(version);
+    const cacheKey = JSON.stringify([version, position]);
+    const cached = this.lineageCache.get(cacheKey);
+    if (cached) return copyLineage(cached);
     const initial: LineageState = createSafeRecord();
     for (const col of this.initialSchema.columns) {
       initial[assertSafeObjectKey(col.name)] = { id: `v${this.initialSchema.version}:base:${col.name}`, revision: 0 };
@@ -176,6 +187,7 @@ export class SchemaMigrationRegistry {
     const revisions = new Map(Object.values(initial).map((lineage) => [lineage.id, lineage.revision]));
     if (version === this.initialSchema.version) {
       if (position !== 'end') throw new SafetyViolationError('INVALID_SCHEMA_POSITION', 'Initial schema has no migration operations.');
+      this.lineageCache.set(cacheKey, copyLineage(current));
       return current;
     }
     for (const step of this.getStepsBetween(this.initialSchema.version, version)) {
@@ -225,6 +237,7 @@ export class SchemaMigrationRegistry {
       }
       history.set(step.toVersion, createSafeRecord(Object.entries(current)));
     }
+    this.lineageCache.set(cacheKey, copyLineage(current));
     return current;
   }
 

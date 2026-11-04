@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { sqliteAvailable as hasSqlite } from './support/sqlite';
 import {
   compileCreateTableSql, createSqliteAdapter, LocalFirstSyncEngine, mergeSqlRowState,
   migrateSqlTable, SchemaMigrationRegistry, validateTableSchema,
@@ -16,7 +17,6 @@ const transform: MigrationStep = {
     { kind: 'transform_column', table: 'items', column: 'estimate', fnName: 'minutes', transform: value => Number(value) * 60 },
   ],
 };
-const hasSqlite = await import('node:sqlite').then(() => true, () => false);
 
 describe('schema review regressions', () => {
   it.each(['INTEGER', 'REAL', 'BOOLEAN', 'JSON'] as const)('rejects a %s primary key', type => {

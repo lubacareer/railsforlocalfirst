@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { formatHlc } from '../src/engine/hlc';
 import { cloneRowState, SchemaMigrationRegistry } from '../src/engine/migrator';
 import { flattenVaultEntry, mergeVaultEntries } from '../src/engine/vault';
@@ -61,5 +61,36 @@ describe('lineage keys', () => {
       operations: [{ kind: 'rename_column', table: 'items', from: 'value', to }],
     }])).toThrow();
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+  });
+});
+
+describe('lineage history caching', () => {
+  it('reuses lineage history and clears it after failed and successful registration', () => {
+    const registry = new SchemaMigrationRegistry(schema, [{
+      fromVersion: 1, toVersion: 2, description: 'rename',
+      operations: [{ kind: 'rename_column', table: 'items', from: 'value', to: 'other' }],
+    }]);
+    const row: CrdtRowState = {
+      table: 'items', pk: 'a', schemaVersion: 2, tombstoneHlc: null,
+      cells: { id: { value: 'a', hlc: hlc(1) } },
+      unmappedFields: { other: { ...legacy(7, 7), sourceVersion: 2 } },
+    };
+    const history = vi.spyOn(registry, 'getStepsBetween');
+    const map = () => registry.mapLegacyVaultEntry(row, 'other', 0, 2, 'end');
+    expect(map().cells.other?.value).toBe(7);
+    expect(map().cells.other?.value).toBe(7);
+    expect(history).toHaveBeenCalledTimes(1);
+    expect(() => registry.registerStep({
+      fromVersion: 2, toVersion: 3, description: 'invalid active lineage', operations: [
+        { kind: 'add_column', table: 'items', column: { name: 'copy', type: 'INTEGER', nullable: true }, restoreFrom: { column: 'other', version: 2 } },
+      ],
+    })).toThrow(/ACTIVE_RESTORED_LINEAGE/);
+    history.mockClear();
+    expect(map().cells.other?.value).toBe(7);
+    expect(history).toHaveBeenCalledTimes(1);
+    registry.registerStep({ fromVersion: 2, toVersion: 3, description: 'valid', operations: [] });
+    history.mockClear();
+    expect(map().cells.other?.value).toBe(7);
+    expect(history).toHaveBeenCalledTimes(1);
   });
 });

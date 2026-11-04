@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { sqliteAvailable as hasSqlite } from './support/sqlite';
 import {
   compileCreateTableSql, compileParameterizedInsert, createSqliteAdapter, formatHlc,
   LocalFirstSyncEngine, migrateSqlTable, SchemaMigrationRegistry, validateTableSchema,
@@ -14,7 +15,6 @@ const schema: TableSchema = {
   ],
 };
 const hlc = (wallTimeMs: number) => formatHlc({ wallTimeMs, counter: 0, nodeId: 'node' });
-const hasSqlite = await import('node:sqlite').then(() => true, () => false);
 
 describe('SQL migration metadata', () => {
   it.each(['_crdt_hlc', '_column_hlcs', '_column_tie_values', '_schema_version', '_unmapped_vault', '_tombstone_hlc', '_causal_version', '_COLUMN_HLCS'])('reserves %s', name => {

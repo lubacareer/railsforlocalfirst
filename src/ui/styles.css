@@ -140,7 +140,7 @@ body {
 
 .grid-two {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
   gap: 1.25rem;
   margin-bottom: 1.5rem;
 }

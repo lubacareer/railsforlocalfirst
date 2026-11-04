@@ -46,7 +46,7 @@ function isRestrictedHost(rawHostname: string): boolean {
     const first = groups[0]!;
     const allZeroPrefix = groups.slice(0, 7).every((group) => group === 0);
     if ((allZeroPrefix && (groups[7] === 0 || groups[7] === 1)) ||
-        (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 ||
+        (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00 ||
         groups.slice(0, 6).every((group) => group === 0) || // IPv4-compatible IPv6
         (first === 0x64 && groups[1] === 0xff9b && groups.slice(2, 6).every((group) => group === 0)) ||
         first === 0x2002 || // 6to4
@@ -100,6 +100,8 @@ export function validateByoStorageConfig(config: ByoStorageConfig): ByoStorageCo
       );
     }
 
+    // This validates the literal hostname only; network adapters must validate
+    // every DNS-resolved address at connection time, including redirects.
     const hostname = parsedUrl.hostname;
     if (isRestrictedHost(hostname)) {
       throw new SafetyViolationError(

@@ -1,16 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { sqliteAvailable } from './support/sqlite';
 import {
   compileCreateTableSql, createPostgresAdapter, createSqliteAdapter, formatHlc,
   listLiveSqlRows, mergeSqlRowState, migrateSqlTable, SchemaMigrationRegistry,
   type CrdtRowState, type TableSchema,
 } from '../src/engine';
 import { flattenVaultEntry } from '../src/engine/vault';
-
-let sqliteAvailable = false;
-try {
-  await import('node:sqlite');
-  sqliteAvailable = true;
-} catch { /* node:sqlite is unavailable on older supported Node releases */ }
 
 const schema: TableSchema = {
   tableName: 'Items', version: 1, primaryKey: 'id', columns: [
