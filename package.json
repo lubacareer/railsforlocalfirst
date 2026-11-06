@@ -1,0 +1,35 @@
+{
+  "name": "rails-for-local-first",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lightweight, open-source sync and deterministic schema migration engine for SQLite/Postgres local-first apps with E2EE BYO-storage.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "benchmark": "vitest bench --run",
+    "test:watch": "vitest",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "pg": "^8.23.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.0",
+    "vitest": "^4.1.12"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}
